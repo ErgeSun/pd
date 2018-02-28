@@ -18,10 +18,10 @@ import (
 	"strconv"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/schedule"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -90,6 +90,7 @@ func newBalanceAdjacentRegionScheduler(limiter *schedule.Limiter, args ...uint64
 		schedule.NewSnapshotCountFilter(),
 		schedule.NewStorageThresholdFilter(),
 		schedule.NewPendingPeerCountFilter(),
+		schedule.NewRejectLeaderFilter(),
 	}
 	base := newBaseScheduler(limiter)
 	s := &balanceAdjacentRegionScheduler{
@@ -127,11 +128,11 @@ func (l *balanceAdjacentRegionScheduler) IsScheduleAllowed(cluster schedule.Clus
 }
 
 func (l *balanceAdjacentRegionScheduler) allowBalanceLeader() bool {
-	return l.limiter.OperatorCount(core.AdjacentLeaderKind) < l.leaderLimit
+	return l.limiter.OperatorCount(schedule.OpAdjacent|schedule.OpLeader) < l.leaderLimit
 }
 
 func (l *balanceAdjacentRegionScheduler) allowBalancePeer() bool {
-	return l.limiter.OperatorCount(core.AdjacentPeerKind) < l.peerLimit
+	return l.limiter.OperatorCount(schedule.OpAdjacent|schedule.OpRegion) < l.peerLimit
 }
 
 func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) *schedule.Operator {
@@ -256,7 +257,7 @@ func (l *balanceAdjacentRegionScheduler) disperseLeader(cluster schedule.Cluster
 		return nil
 	}
 	step := schedule.TransferLeader{FromStore: before.Leader.GetStoreId(), ToStore: target.GetId()}
-	op := schedule.NewOperator("balance-adjacent-leader", before.GetId(), core.AdjacentLeaderKind, step)
+	op := schedule.NewOperator("balance-adjacent-leader", before.GetId(), schedule.OpAdjacent|schedule.OpLeader, step)
 	op.SetPriorityLevel(core.LowPriority)
 	schedulerCounter.WithLabelValues(l.GetName(), "adjacent_leader").Inc()
 	return op
@@ -298,7 +299,7 @@ func (l *balanceAdjacentRegionScheduler) dispersePeer(cluster schedule.Cluster, 
 	// record the store id and exclude it in next time
 	l.cacheRegions.assignedStoreIds = append(l.cacheRegions.assignedStoreIds, newPeer.GetStoreId())
 
-	op := schedule.CreateMovePeerOperator("balance-adjacent-peer", region, core.AdjacentPeerKind, leaderStoreID, newPeer.GetStoreId(), newPeer.GetId())
+	op := schedule.CreateMovePeerOperator("balance-adjacent-peer", cluster, region, schedule.OpAdjacent, leaderStoreID, newPeer.GetStoreId(), newPeer.GetId())
 	op.SetPriorityLevel(core.LowPriority)
 	schedulerCounter.WithLabelValues(l.GetName(), "adjacent_peer").Inc()
 	return op

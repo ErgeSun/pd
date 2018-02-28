@@ -16,6 +16,7 @@ package schedulers
 import (
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/schedule"
+	log "github.com/sirupsen/logrus"
 )
 
 func init() {
@@ -37,6 +38,7 @@ func newBalanceLeaderScheduler(limiter *schedule.Limiter) schedule.Scheduler {
 		schedule.NewBlockFilter(),
 		schedule.NewStateFilter(),
 		schedule.NewHealthFilter(),
+		schedule.NewRejectLeaderFilter(),
 	}
 	base := newBaseScheduler(limiter)
 	return &balanceLeaderScheduler{
@@ -56,7 +58,7 @@ func (l *balanceLeaderScheduler) GetType() string {
 
 func (l *balanceLeaderScheduler) IsScheduleAllowed(cluster schedule.Cluster) bool {
 	limit := minUint64(l.limit, cluster.GetLeaderScheduleLimit())
-	return l.limiter.OperatorCount(core.LeaderKind) < limit
+	return l.limiter.OperatorCount(schedule.OpLeader) < limit
 }
 
 func (l *balanceLeaderScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) *schedule.Operator {
@@ -74,7 +76,8 @@ func (l *balanceLeaderScheduler) Schedule(cluster schedule.Cluster, opInfluence 
 
 	source := cluster.GetStore(region.Leader.GetStoreId())
 	target := cluster.GetStore(newLeader.GetStoreId())
-	avgScore := cluster.GetStoresAverageScore(core.LeaderKind)
+	avgScore := cluster.GetStoresAverageScore(core.LeaderKind, l.selector.GetFilters()...)
+	log.Debugf("[region %d] source store id is %v, target store id is %v, average store score is %f", region.GetId(), source.GetId(), target.GetId(), avgScore)
 	if !shouldBalance(source, target, avgScore, core.LeaderKind, region, opInfluence, cluster.GetTolerantSizeRatio()) {
 		schedulerCounter.WithLabelValues(l.GetName(), "skip").Inc()
 		return nil
@@ -82,5 +85,5 @@ func (l *balanceLeaderScheduler) Schedule(cluster schedule.Cluster, opInfluence 
 	l.limit = adjustBalanceLimit(cluster, core.LeaderKind)
 	schedulerCounter.WithLabelValues(l.GetName(), "new_operator").Inc()
 	step := schedule.TransferLeader{FromStore: region.Leader.GetStoreId(), ToStore: newLeader.GetStoreId()}
-	return schedule.NewOperator("balance-leader", region.GetId(), core.LeaderKind, step)
+	return schedule.NewOperator("balance-leader", region.GetId(), schedule.OpBalance|schedule.OpLeader, step)
 }

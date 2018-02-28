@@ -14,31 +14,33 @@
 package server
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/eraftpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
-	"github.com/pingcap/pd/server/cache"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/namespace"
 	"github.com/pingcap/pd/server/schedule"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
 	runSchedulerCheckInterval = 3 * time.Second
 	collectFactor             = 0.8
-	historiesCacheSize        = 1000
-	eventsCacheSize           = 1000
+	historyKeepTime           = 5 * time.Minute
 	maxScheduleRetries        = 10
 
 	regionheartbeatSendChanCap = 1024
 	hotRegionScheduleName      = "balance-hot-region-scheduler"
+
+	patrolRegionInterval  = time.Millisecond * 100
+	patrolScanRegionLimit = 128 // It takes about 14 minutes to iterate 1 million regions.
 )
 
 var (
@@ -56,11 +58,12 @@ type coordinator struct {
 	cluster          *clusterInfo
 	limiter          *schedule.Limiter
 	replicaChecker   *schedule.ReplicaChecker
+	regionScatterer  *schedule.RegionScatterer
 	namespaceChecker *schedule.NamespaceChecker
 	operators        map[uint64]*schedule.Operator
 	schedulers       map[string]*scheduleController
 	classifier       namespace.Classifier
-	histories        cache.Cache
+	histories        *list.List
 	hbStreams        *heartbeatStreams
 }
 
@@ -72,11 +75,12 @@ func newCoordinator(cluster *clusterInfo, hbStreams *heartbeatStreams, classifie
 		cluster:          cluster,
 		limiter:          schedule.NewLimiter(),
 		replicaChecker:   schedule.NewReplicaChecker(cluster, classifier),
+		regionScatterer:  schedule.NewRegionScatterer(cluster, classifier),
 		namespaceChecker: schedule.NewNamespaceChecker(cluster, classifier),
 		operators:        make(map[uint64]*schedule.Operator),
 		schedulers:       make(map[string]*scheduleController),
 		classifier:       classifier,
-		histories:        cache.NewDefaultCache(historiesCacheSize),
+		histories:        list.New(),
 		hbStreams:        hbStreams,
 	}
 }
@@ -93,6 +97,8 @@ func (c *coordinator) dispatch(region *core.RegionInfo) {
 		if op.IsFinish() {
 			log.Infof("[region %v] operator finish: %s", region.GetId(), op)
 			operatorCounter.WithLabelValues(op.Desc(), "finish").Inc()
+			operatorDuration.WithLabelValues(op.Desc()).Observe(op.ElapsedTime().Seconds())
+			c.pushHistory(op)
 			c.removeOperator(op)
 		} else if timeout {
 			log.Infof("[region %v] operator timeout: %s", region.GetId(), op)
@@ -100,17 +106,47 @@ func (c *coordinator) dispatch(region *core.RegionInfo) {
 			c.removeOperator(op)
 		}
 	}
+}
 
-	// Check replica operator.
-	if c.limiter.OperatorCount(core.RegionKind) >= c.cluster.GetReplicaScheduleLimit() {
-		return
-	}
-	// Generate Operator which moves region to targeted namespace store
-	if op := c.namespaceChecker.Check(region); op != nil {
-		c.addOperator(op)
-	}
-	if op := c.replicaChecker.Check(region); op != nil {
-		c.addOperator(op)
+func (c *coordinator) patrolRegions() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(patrolRegionInterval)
+	defer ticker.Stop()
+
+	log.Info("coordinator: start patrol regions")
+
+	var key []byte
+	for {
+		select {
+		case <-ticker.C:
+		case <-c.ctx.Done():
+			return
+		}
+
+		if c.limiter.OperatorCount(schedule.OpReplica) >= c.cluster.GetReplicaScheduleLimit() {
+			continue
+		}
+
+		regions := c.cluster.ScanRegions(key, patrolScanRegionLimit)
+		if len(regions) == 0 {
+			// reset scan key.
+			key = nil
+			continue
+		}
+
+		for _, region := range regions {
+			key = region.GetEndKey()
+
+			if op := c.namespaceChecker.Check(region); op != nil {
+				c.addOperator(op)
+				break
+			}
+
+			if op := c.replicaChecker.Check(region); op != nil {
+				c.addOperator(op)
+				break
+			}
+		}
 	}
 }
 
@@ -158,6 +194,8 @@ func (c *coordinator) run() {
 		log.Errorf("can't persist schedule config: %v", err)
 	}
 
+	c.wg.Add(1)
+	go c.patrolRegions()
 }
 
 func (c *coordinator) stop() {
@@ -229,8 +267,9 @@ func (c *coordinator) collectHotSpotMetrics() {
 	if !ok {
 		return
 	}
+	stores := c.cluster.GetStores()
 	status := s.Scheduler.(hasHotStatus).GetHotWriteStatus()
-	for _, s := range c.cluster.GetStores() {
+	for _, s := range stores {
 		store := fmt.Sprintf("store_%d", s.GetId())
 		stat, ok := status.AsPeer[s.GetId()]
 		if ok {
@@ -259,7 +298,7 @@ func (c *coordinator) collectHotSpotMetrics() {
 
 	// collect hot read region metrics
 	status = s.Scheduler.(hasHotStatus).GetHotReadStatus()
-	for _, s := range c.cluster.GetStores() {
+	for _, s := range stores {
 		store := fmt.Sprintf("store_%d", s.GetId())
 		stat, ok := status.AsLeader[s.GetId()]
 		if ok {
@@ -364,7 +403,6 @@ func (c *coordinator) addOperator(op *schedule.Operator) bool {
 		c.removeOperatorLocked(old)
 	}
 
-	c.histories.Put(regionID, op)
 	c.operators[regionID] = op
 	c.limiter.UpdateCounts(c.operators)
 
@@ -382,6 +420,25 @@ func isHigherPriorityOperator(new, old *schedule.Operator) bool {
 	return new.GetPriorityLevel() < old.GetPriorityLevel()
 }
 
+func (c *coordinator) pushHistory(op *schedule.Operator) {
+	c.Lock()
+	defer c.Unlock()
+	for _, h := range op.History() {
+		c.histories.PushFront(h)
+	}
+}
+
+func (c *coordinator) pruneHistory() {
+	c.Lock()
+	defer c.Unlock()
+	p := c.histories.Back()
+	for p != nil && time.Since(p.Value.(schedule.OperatorHistory).FinishTime) > historyKeepTime {
+		prev := p.Prev()
+		c.histories.Remove(p)
+		p = prev
+	}
+}
+
 func (c *coordinator) removeOperator(op *schedule.Operator) {
 	c.Lock()
 	defer c.Unlock()
@@ -392,7 +449,6 @@ func (c *coordinator) removeOperatorLocked(op *schedule.Operator) {
 	regionID := op.RegionID()
 	delete(c.operators, regionID)
 	c.limiter.UpdateCounts(c.operators)
-	c.histories.Put(regionID, op)
 	operatorCounter.WithLabelValues(op.Desc(), "remove").Inc()
 }
 
@@ -414,31 +470,18 @@ func (c *coordinator) getOperators() []*schedule.Operator {
 	return operators
 }
 
-func (c *coordinator) getHistories() []*schedule.Operator {
+func (c *coordinator) getHistory(start time.Time) []schedule.OperatorHistory {
 	c.RLock()
 	defer c.RUnlock()
-
-	var operators []*schedule.Operator
-	for _, elem := range c.histories.Elems() {
-		operators = append(operators, elem.Value.(*schedule.Operator))
-	}
-
-	return operators
-}
-
-func (c *coordinator) getHistoriesOfKind(kind core.ResourceKind) []*schedule.Operator {
-	c.RLock()
-	defer c.RUnlock()
-
-	var operators []*schedule.Operator
-	for _, elem := range c.histories.Elems() {
-		op := elem.Value.(*schedule.Operator)
-		if op.ResourceKind() == kind {
-			operators = append(operators, op)
+	histories := make([]schedule.OperatorHistory, 0, c.histories.Len())
+	for p := c.histories.Front(); p != nil; p = p.Next() {
+		history := p.Value.(schedule.OperatorHistory)
+		if history.FinishTime.Before(start) {
+			break
 		}
+		histories = append(histories, history)
 	}
-
-	return operators
+	return histories
 }
 
 func (c *coordinator) sendScheduleCommand(region *core.RegionInfo, step schedule.OperatorStep) {

@@ -15,11 +15,12 @@ package server
 
 import (
 	"strconv"
+	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/schedule"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -52,6 +53,24 @@ func (h *Handler) GetSchedulers() ([]string, error) {
 		return nil, errors.Trace(err)
 	}
 	return c.getSchedulers(), nil
+}
+
+// GetStores returns all stores in the cluster.
+func (h *Handler) GetStores() ([]*core.StoreInfo, error) {
+	cluster := h.s.GetRaftCluster()
+	if cluster == nil {
+		return nil, errors.Trace(errNotBootstrapped)
+	}
+	storeMetas := cluster.GetStores()
+	stores := make([]*core.StoreInfo, 0, len(storeMetas))
+	for _, s := range storeMetas {
+		store, err := cluster.GetStore(s.GetId())
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		stores = append(stores, store)
+	}
+	return stores, nil
 }
 
 // GetHotWriteRegions gets all hot write regions status
@@ -130,6 +149,11 @@ func (h *Handler) AddBalanceHotRegionScheduler() error {
 	return h.AddScheduler("hot-region")
 }
 
+// AddLabelScheduler adds a label-scheduler.
+func (h *Handler) AddLabelScheduler() error {
+	return h.AddScheduler("label")
+}
+
 // AddAdjacentRegionScheduler adds a balance-adjacent-region-scheduler.
 func (h *Handler) AddAdjacentRegionScheduler(args ...string) error {
 	return h.AddScheduler("adjacent-region", args...)
@@ -197,50 +221,41 @@ func (h *Handler) GetOperators() ([]*schedule.Operator, error) {
 
 // GetAdminOperators returns the running admin operators.
 func (h *Handler) GetAdminOperators() ([]*schedule.Operator, error) {
-	return h.GetOperatorsOfKind(core.AdminKind)
+	return h.GetOperatorsOfKind(schedule.OpAdmin)
 }
 
 // GetLeaderOperators returns the running leader operators.
 func (h *Handler) GetLeaderOperators() ([]*schedule.Operator, error) {
-	return h.GetOperatorsOfKind(core.LeaderKind)
+	return h.GetOperatorsOfKind(schedule.OpLeader)
 }
 
 // GetRegionOperators returns the running region operators.
 func (h *Handler) GetRegionOperators() ([]*schedule.Operator, error) {
-	return h.GetOperatorsOfKind(core.RegionKind)
+	return h.GetOperatorsOfKind(schedule.OpRegion)
 }
 
 // GetOperatorsOfKind returns the running operators of the kind.
-func (h *Handler) GetOperatorsOfKind(kind core.ResourceKind) ([]*schedule.Operator, error) {
+func (h *Handler) GetOperatorsOfKind(mask schedule.OperatorKind) ([]*schedule.Operator, error) {
 	ops, err := h.GetOperators()
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	var results []*schedule.Operator
 	for _, op := range ops {
-		if op.ResourceKind() == kind {
+		if op.Kind()&mask != 0 {
 			results = append(results, op)
 		}
 	}
 	return results, nil
 }
 
-// GetHistoryOperators returns history operators
-func (h *Handler) GetHistoryOperators() ([]*schedule.Operator, error) {
+// GetHistory returns finished operators' history since start.
+func (h *Handler) GetHistory(start time.Time) ([]schedule.OperatorHistory, error) {
 	c, err := h.getCoordinator()
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return c.getHistories(), nil
-}
-
-// GetHistoryOperatorsOfKind returns history operators by Kind
-func (h *Handler) GetHistoryOperatorsOfKind(kind core.ResourceKind) ([]*schedule.Operator, error) {
-	c, err := h.getCoordinator()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return c.getHistoriesOfKind(kind), nil
+	return c.getHistory(start), nil
 }
 
 // AddTransferLeaderOperator adds an operator to transfer leader to the store.
@@ -260,7 +275,7 @@ func (h *Handler) AddTransferLeaderOperator(regionID uint64, storeID uint64) err
 	}
 
 	step := schedule.TransferLeader{FromStore: region.Leader.GetStoreId(), ToStore: newLeader.GetStoreId()}
-	op := schedule.NewOperator("adminTransferLeader", regionID, core.AdminKind, step)
+	op := schedule.NewOperator("adminTransferLeader", regionID, schedule.OpAdmin|schedule.OpLeader, step)
 	c.addOperator(op)
 	return nil
 }
@@ -302,7 +317,7 @@ func (h *Handler) AddTransferRegionOperator(regionID uint64, storeIDs map[uint64
 		steps = append(steps, schedule.RemovePeer{FromStore: peer.GetStoreId()})
 	}
 
-	op := schedule.NewOperator("adminMoveRegion", regionID, core.AdminKind, steps...)
+	op := schedule.NewOperator("adminMoveRegion", regionID, schedule.OpAdmin|schedule.OpRegion, steps...)
 	c.addOperator(op)
 	return nil
 }
@@ -332,7 +347,7 @@ func (h *Handler) AddTransferPeerOperator(regionID uint64, fromStoreID, toStoreI
 		return errors.Trace(err)
 	}
 
-	op := schedule.CreateMovePeerOperator("adminMovePeer", region, core.AdminKind, fromStoreID, toStoreID, newPeer.GetId())
+	op := schedule.CreateMovePeerOperator("adminMovePeer", c.cluster, region, schedule.OpAdmin, fromStoreID, toStoreID, newPeer.GetId())
 	c.addOperator(op)
 	return nil
 }
@@ -362,7 +377,7 @@ func (h *Handler) AddAddPeerOperator(regionID uint64, toStoreID uint64) error {
 	}
 
 	step := schedule.AddPeer{ToStore: toStoreID, PeerID: newPeer.GetId()}
-	op := schedule.NewOperator("adminAddPeer", regionID, core.AdminKind, step)
+	op := schedule.NewOperator("adminAddPeer", regionID, schedule.OpAdmin|schedule.OpRegion, step)
 	c.addOperator(op)
 	return nil
 }
@@ -383,7 +398,52 @@ func (h *Handler) AddRemovePeerOperator(regionID uint64, fromStoreID uint64) err
 		return errors.Errorf("region has no peer in store %v", fromStoreID)
 	}
 
-	op := schedule.CreateRemovePeerOperator("adminRemovePeer", region, fromStoreID)
+	op := schedule.CreateRemovePeerOperator("adminRemovePeer", c.cluster, schedule.OpAdmin, region, fromStoreID)
 	c.addOperator(op)
 	return nil
+}
+
+// GetDownPeerRegions gets the region with down peer.
+func (h *Handler) GetDownPeerRegions() ([]*core.RegionInfo, error) {
+	c := h.s.GetRaftCluster()
+	if c == nil {
+		return nil, errNotBootstrapped
+	}
+	return c.cachedCluster.GetRegionStatsByType(downPeer), nil
+}
+
+// GetExtraPeerRegions gets the region exceeds the specified number of peers.
+func (h *Handler) GetExtraPeerRegions() ([]*core.RegionInfo, error) {
+	c := h.s.GetRaftCluster()
+	if c == nil {
+		return nil, errNotBootstrapped
+	}
+	return c.cachedCluster.GetRegionStatsByType(extraPeer), nil
+}
+
+// GetMissPeerRegions gets the region less than the specified number of peers.
+func (h *Handler) GetMissPeerRegions() ([]*core.RegionInfo, error) {
+	c := h.s.GetRaftCluster()
+	if c == nil {
+		return nil, errNotBootstrapped
+	}
+	return c.cachedCluster.GetRegionStatsByType(missPeer), nil
+}
+
+// GetPendingPeerRegions gets the region with pending peer.
+func (h *Handler) GetPendingPeerRegions() ([]*core.RegionInfo, error) {
+	c := h.s.GetRaftCluster()
+	if c == nil {
+		return nil, errNotBootstrapped
+	}
+	return c.cachedCluster.GetRegionStatsByType(pendingPeer), nil
+}
+
+// GetIncorrectNamespaceRegions gets the region with incorrect namespace peer.
+func (h *Handler) GetIncorrectNamespaceRegions() ([]*core.RegionInfo, error) {
+	c := h.s.GetRaftCluster()
+	if c == nil {
+		return nil, errNotBootstrapped
+	}
+	return c.cachedCluster.GetRegionStatsByType(incorrectNamespace), nil
 }

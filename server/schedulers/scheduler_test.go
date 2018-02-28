@@ -15,7 +15,10 @@ package schedulers
 
 import (
 	. "github.com/pingcap/check"
+	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/pd/server/namespace"
 	"github.com/pingcap/pd/server/schedule"
+	log "github.com/sirupsen/logrus"
 )
 
 var _ = Suite(&testShuffleLeaderSuite{})
@@ -109,4 +112,107 @@ func (s *testBalanceAdjacentRegionSuite) TestBalance(c *C) {
 	for i := 0; i < 10; i++ {
 		c.Assert(sc.Schedule(tc, schedule.NewOpInfluence(nil, tc)), IsNil)
 	}
+}
+
+type sequencer struct {
+	maxID uint64
+	curID uint64
+}
+
+func newSequencer(maxID uint64) *sequencer {
+	return &sequencer{
+		maxID: maxID,
+		curID: 0,
+	}
+}
+
+func (s *sequencer) next() uint64 {
+	s.curID++
+	if s.curID > s.maxID {
+		s.curID = 1
+	}
+	return s.curID
+}
+
+var _ = Suite(&testScatterRegionSuite{})
+
+type testScatterRegionSuite struct{}
+
+func (s *testScatterRegionSuite) TestSixStores(c *C) {
+	s.scatter(c, 6, 4)
+}
+
+func (s *testScatterRegionSuite) TestFiveStores(c *C) {
+	s.scatter(c, 5, 5)
+}
+
+func (s *testScatterRegionSuite) scatter(c *C, numStores, numRegions uint64) {
+	opt := newTestScheduleConfig()
+	tc := newMockCluster(opt)
+
+	// Add stores 1~6.
+	for i := uint64(1); i <= numStores; i++ {
+		tc.addRegionStore(i, 0)
+	}
+
+	// Add regions 1~4.
+	seq := newSequencer(numStores)
+	for i := uint64(1); i <= numRegions; i++ {
+		tc.addLeaderRegion(i, seq.next(), seq.next(), seq.next())
+	}
+
+	scatterer := schedule.NewRegionScatterer(tc, namespace.DefaultClassifier)
+
+	for i := uint64(1); i <= numRegions; i++ {
+		region := tc.GetRegion(i)
+		if op := scatterer.Scatter(region); op != nil {
+			log.Info(op)
+			tc.applyOperator(op)
+		}
+	}
+
+	countPeers := make(map[uint64]uint64)
+	for i := uint64(1); i <= numRegions; i++ {
+		region := tc.GetRegion(i)
+		for _, peer := range region.GetPeers() {
+			countPeers[peer.GetStoreId()]++
+		}
+	}
+
+	// Each store should have the same number of peers.
+	for _, count := range countPeers {
+		c.Assert(count, Equals, numRegions*3/numStores)
+	}
+}
+
+var _ = Suite(&testRejectLeaderSuite{})
+
+type testRejectLeaderSuite struct{}
+
+func (s *testRejectLeaderSuite) TestRejectLeader(c *C) {
+	opt := newTestScheduleConfig()
+	opt.LabelProperties = map[string][]*metapb.StoreLabel{
+		schedule.RejectLeader: {{Key: "noleader", Value: "true"}},
+	}
+	tc := newMockCluster(opt)
+
+	// Add 2 stores 1,2.
+	tc.addLabelsStore(1, 1, map[string]string{"noleader": "true"})
+	tc.updateLeaderCount(1, 1)
+	tc.addLeaderStore(2, 10)
+	// Add 2 regions with leader on 1 and 2.
+	tc.addLeaderRegion(1, 1, 2)
+	tc.addLeaderRegion(2, 2, 1)
+
+	// The label scheduler transfers leader out of store1.
+	sl, err := schedule.CreateScheduler("label", schedule.NewLimiter())
+	c.Assert(err, IsNil)
+	op := sl.Schedule(tc, schedule.NewOpInfluence(nil, tc))
+	CheckTransferLeader(c, op, 1, 2)
+
+	// Balancer will not transfer leaders into store1.
+	sl, err = schedule.CreateScheduler("balance-leader", schedule.NewLimiter())
+	c.Assert(err, IsNil)
+	op = sl.Schedule(tc, schedule.NewOpInfluence(nil, tc))
+	c.Assert(op, IsNil)
 }

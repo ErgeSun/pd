@@ -19,12 +19,12 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/namespace"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -60,8 +60,6 @@ type RaftCluster struct {
 
 	wg   sync.WaitGroup
 	quit chan struct{}
-
-	status *ClusterStatus
 }
 
 // ClusterStatus saves some state information
@@ -78,22 +76,19 @@ func newRaftCluster(s *Server, clusterID uint64) *RaftCluster {
 	}
 }
 
-func (c *RaftCluster) loadClusterStatus() error {
+func (c *RaftCluster) loadClusterStatus() (*ClusterStatus, error) {
 	data, err := c.s.kv.Load((c.s.kv.ClusterStatePath("raft_bootstrap_time")))
 	if err != nil {
-		return errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
 	if len(data) == 0 {
-		return nil
+		return &ClusterStatus{}, nil
 	}
 	t, err := parseTimestamp([]byte(data))
 	if err != nil {
-		return errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
-	c.status = &ClusterStatus{
-		RaftBootstrapTime: t,
-	}
-	return nil
+	return &ClusterStatus{RaftBootstrapTime: t}, nil
 }
 
 func (c *RaftCluster) start() error {
@@ -114,6 +109,7 @@ func (c *RaftCluster) start() error {
 	}
 	c.cachedCluster = cluster
 	c.coordinator = newCoordinator(c.cachedCluster, c.s.hbStreams, c.s.classifier)
+	c.cachedCluster.regionStats = newRegionStatistics(c.s.scheduleOpt, c.s.classifier)
 	c.quit = make(chan struct{})
 
 	c.wg.Add(2)
@@ -232,14 +228,24 @@ func (c *RaftCluster) GetRegionInfoByID(regionID uint64) *core.RegionInfo {
 	return c.cachedCluster.GetRegion(regionID)
 }
 
-// GetRegions gets regions from cluster.
-func (c *RaftCluster) GetRegions() []*metapb.Region {
+// GetMetaRegions gets regions from cluster.
+func (c *RaftCluster) GetMetaRegions() []*metapb.Region {
 	return c.cachedCluster.getMetaRegions()
+}
+
+// GetRegions returns all regions info in detail.
+func (c *RaftCluster) GetRegions() []*core.RegionInfo {
+	return c.cachedCluster.getRegions()
 }
 
 // GetRegionStats returns region statistics from cluster.
 func (c *RaftCluster) GetRegionStats(startKey, endKey []byte) *core.RegionStats {
 	return c.cachedCluster.getRegionStats(startKey, endKey)
+}
+
+// DropCacheRegion removes a region from the cache.
+func (c *RaftCluster) DropCacheRegion(id uint64) {
+	c.cachedCluster.dropRegion(id)
 }
 
 // GetStores gets stores from cluster.
@@ -454,6 +460,7 @@ func (c *RaftCluster) collectMetrics() {
 
 	c.coordinator.collectSchedulerMetrics()
 	c.coordinator.collectHotSpotMetrics()
+	cluster.collectMetrics()
 }
 
 func (c *RaftCluster) runBackgroundJobs(interval time.Duration) {
@@ -469,6 +476,7 @@ func (c *RaftCluster) runBackgroundJobs(interval time.Duration) {
 		case <-ticker.C:
 			c.checkStores()
 			c.collectMetrics()
+			c.coordinator.pruneHistory()
 		}
 	}
 }

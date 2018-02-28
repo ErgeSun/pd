@@ -14,7 +14,8 @@
 package server
 
 import (
-	"crypto/tls"
+	"context"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"os"
@@ -27,10 +28,8 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/embed"
-	"github.com/coreos/etcd/pkg/transport"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
@@ -38,6 +37,7 @@ import (
 	"github.com/pingcap/pd/pkg/etcdutil"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/namespace"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
@@ -61,7 +61,9 @@ type Server struct {
 	scheduleOpt *scheduleOption
 	handler     *Handler
 
-	wg sync.WaitGroup
+	leaderLoopCtx    context.Context
+	leaderLoopCancel func()
+	leaderLoopWg     sync.WaitGroup
 
 	// Etcd and cluster informations.
 	etcd        *embed.Etcd
@@ -131,7 +133,7 @@ func (s *Server) startEtcd() error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	tlsConfig, err := s.GetTLSConfig()
+	tlsConfig, err := s.cfg.Security.ToTLSConfig()
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -194,6 +196,9 @@ func (s *Server) startServer() error {
 		return errors.Trace(err)
 	}
 	log.Infof("init cluster id %v", s.clusterID)
+	// It may lose accuracy if use float64 to store uint64. So we store the
+	// cluster id in label.
+	metadataGauge.WithLabelValues(fmt.Sprintf("cluster%d", s.clusterID)).Set(0)
 
 	s.rootPath = path.Join(pdRootPath, strconv.FormatUint(s.clusterID, 10))
 	s.leaderValue = s.marshalLeader()
@@ -253,7 +258,7 @@ func (s *Server) Close() {
 
 	log.Info("closing server")
 
-	s.enableLeader(false)
+	s.stopLeaderLoop()
 
 	if s.client != nil {
 		s.client.Close()
@@ -266,8 +271,6 @@ func (s *Server) Close() {
 	if s.hbStreams != nil {
 		s.hbStreams.Close()
 	}
-
-	s.wg.Wait()
 
 	log.Info("close server")
 }
@@ -296,8 +299,8 @@ func (s *Server) Run() error {
 		return errors.Trace(err)
 	}
 
-	s.wg.Add(1)
-	go s.leaderLoop()
+	s.startLeaderLoop()
+
 	return nil
 }
 
@@ -519,6 +522,38 @@ func (s *Server) DeleteNamespaceConfig(name string) {
 	}
 }
 
+// SetLabelProperty inserts a label property config.
+func (s *Server) SetLabelProperty(typ, labelKey, labelValue string) error {
+	s.scheduleOpt.SetLabelProperty(typ, labelKey, labelValue)
+	err := s.scheduleOpt.persist(s.kv)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	log.Infof("label property config is updated: %+v", s.scheduleOpt.loadLabelPropertyConfig())
+	return nil
+}
+
+// DeleteLabelProperty deletes a label property config.
+func (s *Server) DeleteLabelProperty(typ, labelKey, labelValue string) error {
+	s.scheduleOpt.DeleteLabelProperty(typ, labelKey, labelValue)
+	err := s.scheduleOpt.persist(s.kv)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	log.Infof("label property config is updated: %+v", s.scheduleOpt.loadLabelPropertyConfig())
+	return nil
+}
+
+// GetLabelProperty returns the whole label property config.
+func (s *Server) GetLabelProperty() LabelPropertyConfig {
+	return s.scheduleOpt.loadLabelPropertyConfig().clone()
+}
+
+// GetSecurityConfig get the security config.
+func (s *Server) GetSecurityConfig() *SecurityConfig {
+	return &s.cfg.Security
+}
+
 // IsNamespaceExist returns whether the namespace exists.
 func (s *Server) IsNamespaceExist(name string) bool {
 	return s.classifier.IsNamespaceExist(name)
@@ -549,29 +584,61 @@ func (s *Server) GetCluster() *metapb.Cluster {
 func (s *Server) GetClusterStatus() (*ClusterStatus, error) {
 	s.cluster.Lock()
 	defer s.cluster.Unlock()
-	err := s.cluster.loadClusterStatus()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	clone := &ClusterStatus{}
-	*clone = *s.cluster.status
-	return clone, nil
+	return s.cluster.loadClusterStatus()
 }
 
 func (s *Server) getAllocIDPath() string {
 	return path.Join(s.rootPath, "alloc_id")
 }
 
-// GetTLSConfig gets tls config.
-func (s *Server) GetTLSConfig() (*tls.Config, error) {
-	tlsInfo := transport.TLSInfo{
-		CertFile:      s.cfg.Security.CertPath,
-		KeyFile:       s.cfg.Security.KeyPath,
-		TrustedCAFile: s.cfg.Security.CAPath,
-	}
-	tlsConfig, err := tlsInfo.ClientConfig()
+func (s *Server) getMemberLeaderPriorityPath(id uint64) string {
+	return path.Join(s.rootPath, fmt.Sprintf("member/%d/leader_priority", id))
+}
+
+// SetMemberLeaderPriority saves a member's priority to be elected as the etcd leader.
+func (s *Server) SetMemberLeaderPriority(id uint64, priority int) error {
+	key := s.getMemberLeaderPriorityPath(id)
+	res, err := s.leaderTxn().Then(clientv3.OpPut(key, strconv.Itoa(priority))).Commit()
 	if err != nil {
-		return nil, errors.Trace(err)
+		return errors.Trace(err)
 	}
-	return tlsConfig, nil
+	if !res.Succeeded {
+		return errors.New("save leader priority failed, maybe not leader")
+	}
+	return nil
+}
+
+// DeleteMemberLeaderPriority removes a member's priority config.
+func (s *Server) DeleteMemberLeaderPriority(id uint64) error {
+	key := s.getMemberLeaderPriorityPath(id)
+	res, err := s.leaderTxn().Then(clientv3.OpDelete(key)).Commit()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if !res.Succeeded {
+		return errors.New("delete leader priority failed, maybe not leader")
+	}
+	return nil
+}
+
+// GetMemberLeaderPriority loads a member's priority to be elected as the etcd leader.
+func (s *Server) GetMemberLeaderPriority(id uint64) (int, error) {
+	key := s.getMemberLeaderPriorityPath(id)
+	res, err := kvGet(s.client, key)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	if len(res.Kvs) == 0 {
+		return 0, nil
+	}
+	priority, err := strconv.ParseInt(string(res.Kvs[0].Value), 10, 32)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	return int(priority), nil
+}
+
+// SetLogLevel sets log level.
+func (s *Server) SetLogLevel(level string) {
+	s.cfg.Log.Level = level
 }

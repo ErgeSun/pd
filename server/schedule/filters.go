@@ -17,6 +17,7 @@ import (
 	"github.com/pingcap/pd/server/cache"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/namespace"
+	log "github.com/sirupsen/logrus"
 )
 
 // Filter is an interface to filter source and target store.
@@ -31,6 +32,7 @@ type Filter interface {
 func FilterSource(opt Options, store *core.StoreInfo, filters []Filter) bool {
 	for _, filter := range filters {
 		if filter.FilterSource(opt, store) {
+			log.Debugf("[filter %T] filters store %v from source", filter, store)
 			return true
 		}
 	}
@@ -41,6 +43,7 @@ func FilterSource(opt Options, store *core.StoreInfo, filters []Filter) bool {
 func FilterTarget(opt Options, store *core.StoreInfo, filters []Filter) bool {
 	for _, filter := range filters {
 		if filter.FilterTarget(opt, store) {
+			log.Debugf("[filter %T] filters store %v from target", filter, store)
 			return true
 		}
 	}
@@ -258,4 +261,20 @@ func (f *namespaceFilter) FilterSource(opt Options, store *core.StoreInfo) bool 
 
 func (f *namespaceFilter) FilterTarget(opt Options, store *core.StoreInfo) bool {
 	return f.filter(store)
+}
+
+type rejectLeaderFilter struct{}
+
+// NewRejectLeaderFilter creates a Filter that filters stores that marked as
+// rejectLeader from being the target of leader transfer.
+func NewRejectLeaderFilter() Filter {
+	return rejectLeaderFilter{}
+}
+
+func (f rejectLeaderFilter) FilterSource(opt Options, store *core.StoreInfo) bool {
+	return false
+}
+
+func (f rejectLeaderFilter) FilterTarget(opt Options, store *core.StoreInfo) bool {
+	return opt.CheckLabelProperty(RejectLeader, store.Labels)
 }

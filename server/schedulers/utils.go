@@ -17,11 +17,11 @@ import (
 	"math"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/montanaflynn/stats"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/schedule"
+	log "github.com/sirupsen/logrus"
 )
 
 // scheduleTransferLeader schedules a region to transfer leader to the peer.
@@ -33,12 +33,20 @@ func scheduleTransferLeader(cluster schedule.Cluster, schedulerName string, s sc
 	}
 
 	var averageLeader float64
+	count := 0
 	for _, s := range stores {
-		averageLeader += float64(s.LeaderScore()) / float64(len(stores))
+		if schedule.FilterSource(cluster, s, filters) {
+			continue
+		}
+		averageLeader += float64(s.LeaderScore())
+		count++
 	}
+	averageLeader /= float64(count)
+	log.Debugf("[%s] averageLeader is %v", schedulerName, averageLeader)
 
 	mostLeaderStore := s.SelectSource(cluster, stores, filters...)
 	leastLeaderStore := s.SelectTarget(cluster, stores, filters...)
+	log.Debugf("[%s] mostLeaderStore is %v, leastLeaderStore is %v", schedulerName, mostLeaderStore, leastLeaderStore)
 
 	var mostLeaderDistance, leastLeaderDistance float64
 	if mostLeaderStore != nil {
@@ -47,6 +55,7 @@ func scheduleTransferLeader(cluster schedule.Cluster, schedulerName string, s sc
 	if leastLeaderStore != nil {
 		leastLeaderDistance = math.Abs(leastLeaderStore.LeaderScore() - averageLeader)
 	}
+	log.Debugf("[%s] mostLeaderDistance is %v, leastLeaderDistance is %v", schedulerName, mostLeaderDistance, leastLeaderDistance)
 	if mostLeaderDistance == 0 && leastLeaderDistance == 0 {
 		schedulerCounter.WithLabelValues(schedulerName, "already_balanced").Inc()
 		return nil, nil
@@ -63,7 +72,11 @@ func scheduleTransferLeader(cluster schedule.Cluster, schedulerName string, s sc
 			region, peer = scheduleRemoveLeader(cluster, schedulerName, mostLeaderStore.GetId(), s)
 		}
 	}
-
+	if region == nil {
+		log.Debugf("[%v] select no region", schedulerName)
+	} else {
+		log.Debugf("[region %v][%v] select %v to be new leader", region.GetId(), schedulerName, peer)
+	}
 	return region, peer
 }
 
@@ -172,17 +185,20 @@ func shouldBalance(source, target *core.StoreInfo, avgScore float64, kind core.R
 
 	sourceScore := source.ResourceScore(kind)
 	targetScore := target.ResourceScore(kind)
+	log.Debugf("[region %d] source score is %v and target score is %v", region.GetId(), sourceScore, targetScore)
 	if targetScore >= sourceScore {
+		log.Debugf("should balance return false cause targetScore %v >= sourceScore %v", targetScore, sourceScore)
 		return false
 	}
 
 	// avgScore is the goal for every store
-	// in expection, sourceScore > avgScore > targetScore
+	// in expectation, sourceScore > avgScore > targetScore
 	// if not, moving region is not necessary
 	// In this case, either sourceSizeDiff or targetSizeDiff will be negative, then obviously return false
 	sourceSizeDiff := (sourceScore - avgScore) * source.ResourceWeight(kind)
 	targetSizeDiff := (avgScore - targetScore) * target.ResourceWeight(kind)
 
+	log.Debugf("[region %d] size diff is %v and tolerant size is %v", region.GetId(), math.Min(sourceSizeDiff, targetSizeDiff), float64(region.ApproximateSize)*tolerantRatio)
 	return math.Min(sourceSizeDiff, targetSizeDiff) >= float64(region.ApproximateSize)*tolerantRatio
 }
 

@@ -14,6 +14,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/coreos/etcd/embed"
+	"github.com/coreos/etcd/pkg/transport"
 	"github.com/juju/errors"
 	"github.com/pingcap/pd/pkg/logutil"
 	"github.com/pingcap/pd/pkg/metricutil"
@@ -87,6 +89,8 @@ type Config struct {
 
 	Security SecurityConfig `toml:"security" json:"security"`
 
+	LabelProperty LabelPropertyConfig `toml:"label-property" json:"label-property"`
+
 	configFile string
 
 	// For all warnings during parsing.
@@ -99,6 +103,10 @@ type Config struct {
 	// Only test can change them.
 	nextRetryDelay             time.Duration
 	disableStrictReconfigCheck bool
+
+	heartbeatStreamBindInterval typeutil.Duration
+
+	leaderPriorityCheckInterval typeutil.Duration
 }
 
 // NewConfig creates a new config.
@@ -152,6 +160,10 @@ const (
 	defaultTickInterval = 500 * time.Millisecond
 	// embed etcd has a check that `5 * tick > election`
 	defaultElectionInterval = 3000 * time.Millisecond
+
+	defaultHeartbeatStreamRebindInterval = time.Minute
+
+	defaultLeaderPriorityCheckInterval = time.Minute
 )
 
 func adjustString(v *string, defValue string) {
@@ -266,6 +278,12 @@ func (c *Config) adjust() error {
 
 	adjustString(&c.InitialClusterState, defualtInitialClusterState)
 
+	if len(c.Join) > 0 {
+		if _, err := url.Parse(c.Join); err != nil {
+			return errors.Errorf("failed to parse join addr:%s, err:%v", c.Join, err)
+		}
+	}
+
 	adjustInt64(&c.LeaderLease, defaultLeaderLease)
 
 	adjustDuration(&c.TsoSaveInterval, time.Duration(defaultLeaderLease)*time.Second)
@@ -286,6 +304,10 @@ func (c *Config) adjust() error {
 
 	c.Schedule.adjust()
 	c.Replication.adjust()
+
+	adjustDuration(&c.heartbeatStreamBindInterval, defaultHeartbeatStreamRebindInterval)
+
+	adjustDuration(&c.leaderPriorityCheckInterval, defaultLeaderPriorityCheckInterval)
 	return nil
 }
 
@@ -356,10 +378,10 @@ const (
 	defaultMaxReplicas          = 3
 	defaultMaxSnapshotCount     = 3
 	defaultMaxPendingPeerCount  = 16
-	defaultMaxStoreDownTime     = time.Hour
+	defaultMaxStoreDownTime     = 30 * time.Minute
 	defaultLeaderScheduleLimit  = 64
 	defaultRegionScheduleLimit  = 12
-	defaultReplicaScheduleLimit = 16
+	defaultReplicaScheduleLimit = 32
 	defaultTolerantSizeRatio    = 2.5
 )
 
@@ -367,6 +389,7 @@ var defaultSchedulers = SchedulerConfigs{
 	{Type: "balance-region"},
 	{Type: "balance-leader"},
 	{Type: "hot-region"},
+	{Type: "label"},
 }
 
 func (c *ScheduleConfig) adjust() {
@@ -441,6 +464,42 @@ type SecurityConfig struct {
 	CertPath string `toml:"cert-path" json:"cert-path"`
 	// KeyPath is the path of file that contains X509 key in PEM format.
 	KeyPath string `toml:"key-path" json:"key-path"`
+}
+
+// ToTLSConfig generatres tls config.
+func (s SecurityConfig) ToTLSConfig() (*tls.Config, error) {
+	if len(s.CertPath) == 0 && len(s.KeyPath) == 0 {
+		return nil, nil
+	}
+	tlsInfo := transport.TLSInfo{
+		CertFile:      s.CertPath,
+		KeyFile:       s.KeyPath,
+		TrustedCAFile: s.CAPath,
+	}
+	tlsConfig, err := tlsInfo.ClientConfig()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return tlsConfig, nil
+}
+
+// StoreLabel is the config item of LabelPropertyConfig.
+type StoreLabel struct {
+	Key   string `toml:"key" json:"key"`
+	Value string `toml:"value" json:"value"`
+}
+
+// LabelPropertyConfig is the config section to set properties to store labels.
+type LabelPropertyConfig map[string][]StoreLabel
+
+func (c LabelPropertyConfig) clone() LabelPropertyConfig {
+	m := make(map[string][]StoreLabel, len(c))
+	for k, sl := range c {
+		sl2 := make([]StoreLabel, 0, len(sl))
+		sl2 = append(sl2, sl...)
+		m[k] = sl2
+	}
+	return m
 }
 
 // ParseUrls parse a string into multiple urls.
