@@ -95,16 +95,12 @@ func NewStateFilter() Filter {
 	return &stateFilter{}
 }
 
-func (f *stateFilter) filter(store *core.StoreInfo) bool {
-	return !store.IsUp()
-}
-
 func (f *stateFilter) FilterSource(opt Options, store *core.StoreInfo) bool {
-	return f.filter(store)
+	return store.IsTombstone()
 }
 
 func (f *stateFilter) FilterTarget(opt Options, store *core.StoreInfo) bool {
-	return f.filter(store)
+	return !store.IsUp()
 }
 
 type healthFilter struct{}
@@ -132,7 +128,7 @@ func (f *healthFilter) FilterTarget(opt Options, store *core.StoreInfo) bool {
 type pendingPeerCountFilter struct{}
 
 // NewPendingPeerCountFilter creates a Filter that filters all stores that are
-// currently handling too many pengding peers.
+// currently handling too many pending peers.
 func NewPendingPeerCountFilter() Filter {
 	return &pendingPeerCountFilter{}
 }
@@ -201,7 +197,7 @@ func (f *storageThresholdFilter) FilterSource(opt Options, store *core.StoreInfo
 }
 
 func (f *storageThresholdFilter) FilterTarget(opt Options, store *core.StoreInfo) bool {
-	return store.IsLowSpace()
+	return store.IsLowSpace(opt.GetLowSpaceRatio())
 }
 
 // distinctScoreFilter ensures that distinct score will not decrease.

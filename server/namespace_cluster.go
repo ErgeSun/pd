@@ -60,9 +60,9 @@ func (c *namespaceCluster) checkRegion(region *core.RegionInfo) bool {
 const randRegionMaxRetry = 10
 
 // RandFollowerRegion returns a random region that has a follower on the store.
-func (c *namespaceCluster) RandFollowerRegion(storeID uint64) *core.RegionInfo {
+func (c *namespaceCluster) RandFollowerRegion(storeID uint64, opts ...core.RegionOption) *core.RegionInfo {
 	for i := 0; i < randRegionMaxRetry; i++ {
-		r := c.Cluster.RandFollowerRegion(storeID)
+		r := c.Cluster.RandFollowerRegion(storeID, opts...)
 		if r == nil {
 			return nil
 		}
@@ -74,9 +74,9 @@ func (c *namespaceCluster) RandFollowerRegion(storeID uint64) *core.RegionInfo {
 }
 
 // RandLeaderRegion returns a random region that has leader on the store.
-func (c *namespaceCluster) RandLeaderRegion(storeID uint64) *core.RegionInfo {
+func (c *namespaceCluster) RandLeaderRegion(storeID uint64, opts ...core.RegionOption) *core.RegionInfo {
 	for i := 0; i < randRegionMaxRetry; i++ {
-		r := c.Cluster.RandLeaderRegion(storeID)
+		r := c.Cluster.RandLeaderRegion(storeID, opts...)
 		if r == nil {
 			return nil
 		}
@@ -122,7 +122,7 @@ func (c *namespaceCluster) RegionWriteStats() []*core.RegionStat {
 	return stats
 }
 
-func scheduleByNamespace(cluster schedule.Cluster, classifier namespace.Classifier, scheduler schedule.Scheduler, opInfluence schedule.OpInfluence) *schedule.Operator {
+func scheduleByNamespace(cluster schedule.Cluster, classifier namespace.Classifier, scheduler schedule.Scheduler, opInfluence schedule.OpInfluence) []*schedule.Operator {
 	namespaces := classifier.GetAllNamespaces()
 	for _, i := range rand.Perm(len(namespaces)) {
 		nc := newNamespaceCluster(cluster, classifier, namespaces[i])
@@ -143,6 +143,10 @@ func (c *namespaceCluster) GetRegionScheduleLimit() uint64 {
 
 func (c *namespaceCluster) GetReplicaScheduleLimit() uint64 {
 	return c.GetOpt().GetReplicaScheduleLimit(c.namespace)
+}
+
+func (c *namespaceCluster) GetMergeScheduleLimit() uint64 {
+	return c.GetOpt().GetMergeScheduleLimit(c.namespace)
 }
 
 func (c *namespaceCluster) GetMaxReplicas() int {

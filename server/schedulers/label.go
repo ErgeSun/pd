@@ -55,7 +55,7 @@ func (s *labelScheduler) IsScheduleAllowed(cluster schedule.Cluster) bool {
 	return s.limiter.OperatorCount(schedule.OpLeader) < cluster.GetLeaderScheduleLimit()
 }
 
-func (s *labelScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) *schedule.Operator {
+func (s *labelScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) []*schedule.Operator {
 	schedulerCounter.WithLabelValues(s.GetName(), "schedule").Inc()
 	stores := cluster.GetStores()
 	rejectLeaderStores := make(map[uint64]struct{})
@@ -70,7 +70,7 @@ func (s *labelScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule
 	}
 	log.Debugf("label scheduler reject leader store list: %v", rejectLeaderStores)
 	for id := range rejectLeaderStores {
-		if region := cluster.RandLeaderRegion(id); region != nil {
+		if region := cluster.RandLeaderRegion(id, core.HealthRegion()); region != nil {
 			log.Debugf("label scheduler selects region %d to transfer leader", region.GetId())
 			target := s.selector.SelectTarget(cluster, cluster.GetFollowerStores(region))
 			if target == nil {
@@ -81,7 +81,8 @@ func (s *labelScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule
 
 			schedulerCounter.WithLabelValues(s.GetName(), "new_operator").Inc()
 			step := schedule.TransferLeader{FromStore: id, ToStore: target.GetId()}
-			return schedule.NewOperator("label-reject-leader", region.GetId(), schedule.OpLeader, step)
+			op := schedule.NewOperator("label-reject-leader", region.GetId(), schedule.OpLeader, step)
+			return []*schedule.Operator{op}
 		}
 	}
 	schedulerCounter.WithLabelValues(s.GetName(), "no_region").Inc()

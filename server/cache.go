@@ -27,33 +27,26 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var (
-	errRegionNotFound = func(regionID uint64) error {
-		return errors.Errorf("region %v not found", regionID)
-	}
-	errRegionIsStale = func(region *metapb.Region, origin *metapb.Region) error {
-		return errors.Errorf("region is stale: region %v origin %v", region, origin)
-	}
-)
-
 type clusterInfo struct {
 	sync.RWMutex
 	*schedule.BasicCluster
 
-	id            core.IDAllocator
-	kv            *core.KV
-	meta          *metapb.Cluster
-	activeRegions int
-	opt           *scheduleOption
-	regionStats   *regionStatistics
+	id              core.IDAllocator
+	kv              *core.KV
+	meta            *metapb.Cluster
+	activeRegions   int
+	opt             *scheduleOption
+	regionStats     *regionStatistics
+	labelLevelStats *labelLevelStatistics
 }
 
 func newClusterInfo(id core.IDAllocator, opt *scheduleOption, kv *core.KV) *clusterInfo {
 	return &clusterInfo{
-		BasicCluster: schedule.NewBasicCluster(),
-		id:           id,
-		opt:          opt,
-		kv:           kv,
+		BasicCluster:    schedule.NewBasicCluster(),
+		id:              id,
+		opt:             opt,
+		kv:              kv,
+		labelLevelStats: newLabelLevelStatistics(),
 	}
 }
 
@@ -174,28 +167,6 @@ func (c *clusterInfo) GetStores() []*core.StoreInfo {
 	return c.BasicCluster.GetStores()
 }
 
-// GetStoresAverageScore returns the total resource score of all unfiltered stores.
-func (c *clusterInfo) GetStoresAverageScore(kind core.ResourceKind, filters ...schedule.Filter) float64 {
-	c.RLock()
-	defer c.RUnlock()
-
-	var totalResourceSize int64
-	var totalResourceWeight float64
-	for _, s := range c.BasicCluster.GetStores() {
-		if schedule.FilterSource(c, s, filters) {
-			continue
-		}
-
-		totalResourceWeight += s.ResourceWeight(kind)
-		totalResourceSize += s.ResourceSize(kind)
-	}
-
-	if totalResourceWeight == 0 {
-		return 0
-	}
-	return float64(totalResourceSize) / totalResourceWeight
-}
-
 func (c *clusterInfo) getMetaStores() []*metapb.Store {
 	c.RLock()
 	defer c.RUnlock()
@@ -227,6 +198,13 @@ func (c *clusterInfo) ScanRegions(startKey []byte, limit int) []*core.RegionInfo
 	return c.Regions.ScanRange(startKey, limit)
 }
 
+// GetAdjacentRegions returns region's info that is adjacent with specific region
+func (c *clusterInfo) GetAdjacentRegions(region *core.RegionInfo) (*core.RegionInfo, *core.RegionInfo) {
+	c.RLock()
+	defer c.RUnlock()
+	return c.BasicCluster.GetAdjacentRegions(region)
+}
+
 // GetRegion searches for a region by ID.
 func (c *clusterInfo) GetRegion(regionID uint64) *core.RegionInfo {
 	c.RLock()
@@ -238,7 +216,18 @@ func (c *clusterInfo) GetRegion(regionID uint64) *core.RegionInfo {
 func (c *clusterInfo) IsRegionHot(id uint64) bool {
 	c.RLock()
 	defer c.RUnlock()
-	return c.BasicCluster.IsRegionHot(id)
+	return c.BasicCluster.IsRegionHot(id, c.GetHotRegionLowThreshold())
+}
+
+// RandHotRegionFromStore randomly picks a hot region in specified store.
+func (c *clusterInfo) RandHotRegionFromStore(store uint64, kind schedule.FlowKind) *core.RegionInfo {
+	c.RLock()
+	defer c.RUnlock()
+	r := c.HotCache.RandHotRegionFromStore(store, kind, c.GetHotRegionLowThreshold())
+	if r == nil {
+		return nil
+	}
+	return c.BasicCluster.GetRegion(r.RegionID)
 }
 
 func (c *clusterInfo) searchRegion(regionKey []byte) *core.RegionInfo {
@@ -268,10 +257,10 @@ func (c *clusterInfo) getRegions() []*core.RegionInfo {
 	return c.Regions.GetRegions()
 }
 
-func (c *clusterInfo) randomRegion() *core.RegionInfo {
+func (c *clusterInfo) randomRegion(opts ...core.RegionOption) *core.RegionInfo {
 	c.RLock()
 	defer c.RUnlock()
-	return c.Regions.RandRegion()
+	return c.Regions.RandRegion(opts...)
 }
 
 func (c *clusterInfo) getMetaRegions() []*metapb.Region {
@@ -313,17 +302,17 @@ func (c *clusterInfo) getStoreLeaderCount(storeID uint64) int {
 }
 
 // RandLeaderRegion returns a random region that has leader on the store.
-func (c *clusterInfo) RandLeaderRegion(storeID uint64) *core.RegionInfo {
+func (c *clusterInfo) RandLeaderRegion(storeID uint64, opts ...core.RegionOption) *core.RegionInfo {
 	c.RLock()
 	defer c.RUnlock()
-	return c.BasicCluster.RandLeaderRegion(storeID)
+	return c.BasicCluster.RandLeaderRegion(storeID, opts...)
 }
 
 // RandFollowerRegion returns a random region that has a follower on the store.
-func (c *clusterInfo) RandFollowerRegion(storeID uint64) *core.RegionInfo {
+func (c *clusterInfo) RandFollowerRegion(storeID uint64, opts ...core.RegionOption) *core.RegionInfo {
 	c.RLock()
 	defer c.RUnlock()
-	return c.BasicCluster.RandFollowerRegion(storeID)
+	return c.BasicCluster.RandFollowerRegion(storeID, opts...)
 }
 
 // GetRegionStores returns all stores that contains the region's peer.
@@ -416,7 +405,7 @@ func (c *clusterInfo) handleRegionHeartbeat(region *core.RegionInfo) error {
 		o := origin.GetRegionEpoch()
 		// Region meta is stale, return an error.
 		if r.GetVersion() < o.GetVersion() || r.GetConfVer() < o.GetConfVer() {
-			return errors.Trace(errRegionIsStale(region.Region, origin.Region))
+			return errors.Trace(ErrRegionIsStale(region.Region, origin.Region))
 		}
 		if r.GetVersion() > o.GetVersion() {
 			log.Infof("[region %d] %s, Version changed from {%d} to {%d}", region.GetId(), core.DiffRegionKeyInfo(origin, region), o.GetVersion(), r.GetVersion())
@@ -470,6 +459,12 @@ func (c *clusterInfo) handleRegionHeartbeat(region *core.RegionInfo) error {
 				}
 			}
 		}
+		for _, item := range overlaps {
+			if c.regionStats != nil {
+				c.regionStats.clearDefunctRegion(item.GetId())
+			}
+			c.labelLevelStats.clearDefunctRegion(item.GetId())
+		}
 
 		// Update related stores.
 		if origin != nil {
@@ -483,25 +478,25 @@ func (c *clusterInfo) handleRegionHeartbeat(region *core.RegionInfo) error {
 	}
 
 	if c.regionStats != nil {
-		c.regionStats.Observe(region, c.getRegionStores(region), c.GetLocationLabels())
+		c.regionStats.Observe(region, c.getRegionStores(region))
 	}
 
 	key := region.GetId()
 	if isWriteUpdate {
-		if writeItem == nil {
-			c.WriteStatistics.Remove(key)
-		} else {
-			c.WriteStatistics.Put(key, writeItem)
-		}
+		c.HotCache.Update(key, writeItem, schedule.WriteFlow)
 	}
 	if isReadUpdate {
-		if readItem == nil {
-			c.ReadStatistics.Remove(key)
-		} else {
-			c.ReadStatistics.Put(key, readItem)
-		}
+		c.HotCache.Update(key, readItem, schedule.ReadFlow)
 	}
 	return nil
+}
+
+func (c *clusterInfo) updateRegionsLabelLevelStats(regions []*core.RegionInfo) {
+	c.Lock()
+	defer c.Unlock()
+	for _, region := range regions {
+		c.labelLevelStats.Observe(region, c.getRegionStores(region), c.GetLocationLabels())
+	}
 }
 
 func (c *clusterInfo) collectMetrics() {
@@ -511,6 +506,7 @@ func (c *clusterInfo) collectMetrics() {
 	c.RLock()
 	defer c.RUnlock()
 	c.regionStats.Collect()
+	c.labelLevelStats.Collect()
 }
 
 func (c *clusterInfo) GetRegionStatsByType(typ regionStatisticType) []*core.RegionInfo {
@@ -538,8 +534,20 @@ func (c *clusterInfo) GetReplicaScheduleLimit() uint64 {
 	return c.opt.GetReplicaScheduleLimit(namespace.DefaultNamespace)
 }
 
+func (c *clusterInfo) GetMergeScheduleLimit() uint64 {
+	return c.opt.GetMergeScheduleLimit(namespace.DefaultNamespace)
+}
+
 func (c *clusterInfo) GetTolerantSizeRatio() float64 {
 	return c.opt.GetTolerantSizeRatio()
+}
+
+func (c *clusterInfo) GetLowSpaceRatio() float64 {
+	return c.opt.GetLowSpaceRatio()
+}
+
+func (c *clusterInfo) GetHighSpaceRatio() float64 {
+	return c.opt.GetHighSpaceRatio()
 }
 
 func (c *clusterInfo) GetMaxSnapshotCount() uint64 {
@@ -548,6 +556,10 @@ func (c *clusterInfo) GetMaxSnapshotCount() uint64 {
 
 func (c *clusterInfo) GetMaxPendingPeerCount() uint64 {
 	return c.opt.GetMaxPendingPeerCount()
+}
+
+func (c *clusterInfo) GetMaxMergeRegionSize() uint64 {
+	return c.opt.GetMaxMergeRegionSize()
 }
 
 func (c *clusterInfo) GetMaxStoreDownTime() time.Duration {
@@ -564,6 +576,10 @@ func (c *clusterInfo) GetLocationLabels() []string {
 
 func (c *clusterInfo) GetHotRegionLowThreshold() int {
 	return c.opt.GetHotRegionLowThreshold()
+}
+
+func (c *clusterInfo) IsRaftLearnerEnabled() bool {
+	return c.opt.IsRaftLearnerEnabled()
 }
 
 func (c *clusterInfo) CheckLabelProperty(typ string, labels []*metapb.StoreLabel) bool {

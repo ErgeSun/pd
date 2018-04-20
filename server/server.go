@@ -219,7 +219,7 @@ func (s *Server) startServer() error {
 
 func (s *Server) initClusterID() error {
 	// Get any cluster key to parse the cluster ID.
-	resp, err := kvGet(s.client, pdRootPath, clientv3.WithFirstCreate()...)
+	resp, err := kvGet(s.client, pdClusterIDPath)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -229,23 +229,7 @@ func (s *Server) initClusterID() error {
 		s.clusterID, err = initOrGetClusterID(s.client, pdClusterIDPath)
 		return errors.Trace(err)
 	}
-
-	key := string(resp.Kvs[0].Key)
-
-	// If the key is "pdClusterIDPath", parse the cluster ID from it.
-	if key == pdClusterIDPath {
-		s.clusterID, err = bytesToUint64(resp.Kvs[0].Value)
-		return errors.Trace(err)
-	}
-
-	// Parse the cluster ID from any other keys for compatibility.
-	elems := strings.Split(key, "/")
-	if len(elems) < 3 {
-		return errors.Errorf("invalid cluster key %v", key)
-	}
-	s.clusterID, err = strconv.ParseUint(elems[2], 10, 64)
-
-	log.Infof("init and load cluster id: %d", s.clusterID)
+	s.clusterID, err = bytesToUint64(resp.Kvs[0].Value)
 	return errors.Trace(err)
 }
 
@@ -442,6 +426,7 @@ func (s *Server) GetConfig() *Config {
 		namespaces[name] = *opt.load()
 	}
 	cfg.Namespace = namespaces
+	cfg.LabelProperty = s.scheduleOpt.loadLabelPropertyConfig().clone()
 	return cfg
 }
 
@@ -641,4 +626,24 @@ func (s *Server) GetMemberLeaderPriority(id uint64) (int, error) {
 // SetLogLevel sets log level.
 func (s *Server) SetLogLevel(level string) {
 	s.cfg.Log.Level = level
+}
+
+var healthURL = "/pd/ping"
+
+// CheckHealth checks if members are healthy
+func (s *Server) CheckHealth(members []*pdpb.Member) map[uint64]*pdpb.Member {
+	unhealthMembers := make(map[uint64]*pdpb.Member)
+	for _, member := range members {
+		for _, cURL := range member.ClientUrls {
+			resp, err := DialClient.Get(fmt.Sprintf("%s%s", cURL, healthURL))
+			if resp != nil {
+				resp.Body.Close()
+			}
+			if err != nil || resp.StatusCode != http.StatusOK {
+				unhealthMembers[member.GetMemberId()] = member
+				break
+			}
+		}
+	}
+	return unhealthMembers
 }

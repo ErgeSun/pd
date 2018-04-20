@@ -28,12 +28,14 @@ import (
 	"github.com/unrolled/render"
 )
 
-type metaStore struct {
+// MetaStore contains meta information about a store.
+type MetaStore struct {
 	*metapb.Store
 	StateName string `json:"state_name"`
 }
 
-type storeStatus struct {
+// StoreStatus contains status about a store.
+type StoreStatus struct {
 	Capacity           typeutil.ByteSize  `json:"capacity,omitempty"`
 	Available          typeutil.ByteSize  `json:"available,omitempty"`
 	LeaderCount        int                `json:"leader_count,omitempty"`
@@ -53,9 +55,10 @@ type storeStatus struct {
 	Uptime             *typeutil.Duration `json:"uptime,omitempty"`
 }
 
-type storeInfo struct {
-	Store  *metaStore   `json:"store"`
-	Status *storeStatus `json:"status"`
+// StoreInfo contains information about a store.
+type StoreInfo struct {
+	Store  *MetaStore   `json:"store"`
+	Status *StoreStatus `json:"status"`
 }
 
 const (
@@ -63,22 +66,22 @@ const (
 	downStateName    = "Down"
 )
 
-func newStoreInfo(store *core.StoreInfo, maxStoreDownTime time.Duration) *storeInfo {
-	s := &storeInfo{
-		Store: &metaStore{
+func newStoreInfo(opt *server.ScheduleConfig, store *core.StoreInfo) *StoreInfo {
+	s := &StoreInfo{
+		Store: &MetaStore{
 			Store:     store.Store,
 			StateName: store.State.String(),
 		},
-		Status: &storeStatus{
+		Status: &StoreStatus{
 			Capacity:           typeutil.ByteSize(store.Stats.GetCapacity()),
 			Available:          typeutil.ByteSize(store.Stats.GetAvailable()),
 			LeaderCount:        store.LeaderCount,
 			LeaderWeight:       store.LeaderWeight,
-			LeaderScore:        store.LeaderScore(),
+			LeaderScore:        store.LeaderScore(0),
 			LeaderSize:         store.LeaderSize,
 			RegionCount:        store.RegionCount,
 			RegionWeight:       store.RegionWeight,
-			RegionScore:        store.RegionScore(),
+			RegionScore:        store.RegionScore(opt.HighSpaceRatio, opt.LowSpaceRatio, 0),
 			RegionSize:         store.RegionSize,
 			SendingSnapCount:   store.Stats.GetSendingSnapCount(),
 			ReceivingSnapCount: store.Stats.GetReceivingSnapCount(),
@@ -100,7 +103,7 @@ func newStoreInfo(store *core.StoreInfo, maxStoreDownTime time.Duration) *storeI
 	}
 
 	if store.State == metapb.StoreState_Up {
-		if store.DownTime() > maxStoreDownTime {
+		if store.DownTime() > opt.MaxStoreDownTime.Duration {
 			s.Store.StateName = downStateName
 		} else if store.IsDisconnected() {
 			s.Store.StateName = disconnectedName
@@ -109,9 +112,10 @@ func newStoreInfo(store *core.StoreInfo, maxStoreDownTime time.Duration) *storeI
 	return s
 }
 
-type storesInfo struct {
+// StoresInfo records stores' info.
+type StoresInfo struct {
 	Count  int          `json:"count"`
-	Stores []*storeInfo `json:"stores"`
+	Stores []*StoreInfo `json:"stores"`
 }
 
 type storeHandler struct {
@@ -133,8 +137,6 @@ func (h *storeHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maxStoreDownTime := h.svr.GetScheduleConfig().MaxStoreDownTime.Duration
-
 	vars := mux.Vars(r)
 	storeIDStr := vars["id"]
 	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
@@ -149,7 +151,7 @@ func (h *storeHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	storeInfo := newStoreInfo(store, maxStoreDownTime)
+	storeInfo := newStoreInfo(h.svr.GetScheduleConfig(), store)
 	h.rd.JSON(w, http.StatusOK, storeInfo)
 }
 
@@ -320,11 +322,9 @@ func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maxStoreDownTime := h.svr.GetScheduleConfig().MaxStoreDownTime.Duration
-
 	stores := cluster.GetStores()
-	storesInfo := &storesInfo{
-		Stores: make([]*storeInfo, 0, len(stores)),
+	StoresInfo := &StoresInfo{
+		Stores: make([]*StoreInfo, 0, len(stores)),
 	}
 
 	urlFilter, err := newStoreStateFilter(r.URL)
@@ -341,12 +341,12 @@ func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		storeInfo := newStoreInfo(store, maxStoreDownTime)
-		storesInfo.Stores = append(storesInfo.Stores, storeInfo)
+		storeInfo := newStoreInfo(h.svr.GetScheduleConfig(), store)
+		StoresInfo.Stores = append(StoresInfo.Stores, storeInfo)
 	}
-	storesInfo.Count = len(storesInfo.Stores)
+	StoresInfo.Count = len(StoresInfo.Stores)
 
-	h.rd.JSON(w, http.StatusOK, storesInfo)
+	h.rd.JSON(w, http.StatusOK, StoresInfo)
 }
 
 type storeStateFilter struct {

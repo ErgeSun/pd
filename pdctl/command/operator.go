@@ -78,6 +78,9 @@ func NewAddOperatorCommand() *cobra.Command {
 	c.AddCommand(NewTransferPeerCommand())
 	c.AddCommand(NewAddPeerCommand())
 	c.AddCommand(NewRemovePeerCommand())
+	c.AddCommand(NewMergeRegionCommand())
+	c.AddCommand(NewSplitRegionCommand())
+	c.AddCommand(NewScatterRegionCommand())
 	return c
 }
 
@@ -198,6 +201,35 @@ func addPeerCommandFunc(cmd *cobra.Command, args []string) {
 	postJSON(cmd, operatorsPrefix, input)
 }
 
+// NewMergeRegionCommand returns a command to merge two regions.
+func NewMergeRegionCommand() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "merge-region <source_region_id> <target_region_id>",
+		Short: "merge source region into target reigon",
+		Run:   mergeRegionCommandFunc,
+	}
+	return c
+}
+
+func mergeRegionCommandFunc(cmd *cobra.Command, args []string) {
+	if len(args) != 2 {
+		fmt.Println(cmd.UsageString())
+		return
+	}
+
+	ids, err := parseUint64s(args)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	input := make(map[string]interface{})
+	input["name"] = cmd.Name()
+	input["source_region_id"] = ids[0]
+	input["target_region_id"] = ids[1]
+	postJSON(cmd, operatorsPrefix, input)
+}
+
 // NewRemovePeerCommand returns a command to add region peer.
 func NewRemovePeerCommand() *cobra.Command {
 	c := &cobra.Command{
@@ -224,6 +256,62 @@ func removePeerCommandFunc(cmd *cobra.Command, args []string) {
 	input["name"] = cmd.Name()
 	input["region_id"] = ids[0]
 	input["store_id"] = ids[1]
+	postJSON(cmd, operatorsPrefix, input)
+}
+
+// NewSplitRegionCommand returns a command to split a region.
+func NewSplitRegionCommand() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "split-region <region_id>",
+		Short: "split a region",
+		Run:   splitRegionCommandFunc,
+	}
+	return c
+}
+
+func splitRegionCommandFunc(cmd *cobra.Command, args []string) {
+	if len(args) != 1 {
+		fmt.Println(cmd.UsageString())
+		return
+	}
+
+	ids, err := parseUint64s(args)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	input := make(map[string]interface{})
+	input["name"] = cmd.Name()
+	input["region_id"] = ids[0]
+	postJSON(cmd, operatorsPrefix, input)
+}
+
+// NewScatterRegionCommand returns a command to scatter a region.
+func NewScatterRegionCommand() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "scatter-region <region_id>",
+		Short: "scatter a region",
+		Run:   scatterRegionCommandFunc,
+	}
+	return c
+}
+
+func scatterRegionCommandFunc(cmd *cobra.Command, args []string) {
+	if len(args) != 1 {
+		fmt.Println(cmd.UsageString())
+		return
+	}
+
+	ids, err := parseUint64s(args)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	input := make(map[string]interface{})
+	input["name"] = cmd.Name()
+	input["region_id"] = ids[0]
 	postJSON(cmd, operatorsPrefix, input)
 }
 

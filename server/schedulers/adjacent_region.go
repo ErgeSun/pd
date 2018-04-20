@@ -88,7 +88,6 @@ func newBalanceAdjacentRegionScheduler(limiter *schedule.Limiter, args ...uint64
 		schedule.NewStateFilter(),
 		schedule.NewHealthFilter(),
 		schedule.NewSnapshotCountFilter(),
-		schedule.NewStorageThresholdFilter(),
 		schedule.NewPendingPeerCountFilter(),
 		schedule.NewRejectLeaderFilter(),
 	}
@@ -135,7 +134,7 @@ func (l *balanceAdjacentRegionScheduler) allowBalancePeer() bool {
 	return l.limiter.OperatorCount(schedule.OpAdjacent|schedule.OpRegion) < l.peerLimit
 }
 
-func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) *schedule.Operator {
+func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) []*schedule.Operator {
 	if l.cacheRegions == nil {
 		l.cacheRegions = &adjacentState{
 			assignedStoreIds: make([]uint64, 0, len(cluster.GetStores())),
@@ -192,7 +191,7 @@ func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opIn
 	return l.process(cluster)
 }
 
-func (l *balanceAdjacentRegionScheduler) process(cluster schedule.Cluster) *schedule.Operator {
+func (l *balanceAdjacentRegionScheduler) process(cluster schedule.Cluster) []*schedule.Operator {
 	if l.cacheRegions.len() < 2 {
 		return nil
 	}
@@ -220,7 +219,7 @@ func (l *balanceAdjacentRegionScheduler) process(cluster schedule.Cluster) *sche
 		schedulerCounter.WithLabelValues(l.GetName(), "no_peer").Inc()
 		l.cacheRegions.assignedStoreIds = l.cacheRegions.assignedStoreIds[:0]
 	}
-	return op
+	return []*schedule.Operator{op}
 }
 
 func (l *balanceAdjacentRegionScheduler) unsafeToBalance(cluster schedule.Cluster, region *core.RegionInfo) bool {

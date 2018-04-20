@@ -22,6 +22,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
+	"github.com/pingcap/pd/pkg/logutil"
 	"github.com/pingcap/pd/server/core"
 	"github.com/pingcap/pd/server/namespace"
 	log "github.com/sirupsen/logrus"
@@ -29,11 +30,6 @@ import (
 
 const (
 	backgroundJobInterval = time.Minute
-)
-
-// Error instances
-var (
-	ErrNotBootstrapped = errors.New("TiKV cluster is not bootstrapped, please start TiKV first")
 )
 
 // RaftCluster is used for cluster config management.
@@ -122,6 +118,8 @@ func (c *RaftCluster) start() error {
 }
 
 func (c *RaftCluster) runCoordinator() {
+	defer logutil.LogPanic()
+
 	c.coordinator.run()
 	c.wg.Done()
 }
@@ -264,6 +262,11 @@ func (c *RaftCluster) GetStore(storeID uint64) (*core.StoreInfo, error) {
 		return nil, errors.Errorf("invalid store ID %d, not found", storeID)
 	}
 	return store, nil
+}
+
+// GetAdjacentRegions returns region's info that is adjacent with specific region id.
+func (c *RaftCluster) GetAdjacentRegions(region *core.RegionInfo) (*core.RegionInfo, *core.RegionInfo) {
+	return c.cachedCluster.GetAdjacentRegions(region)
 }
 
 // UpdateStoreLabels updates a store's location labels.
@@ -431,6 +434,25 @@ func (c *RaftCluster) checkStores() {
 	}
 }
 
+func (c *RaftCluster) checkOperators() {
+	co := c.coordinator
+	for _, op := range co.getOperators() {
+		// after region is merged, it will not heartbeat anymore
+		// the operator of merged region will not timeout actively
+		if c.cachedCluster.GetRegion(op.RegionID()) == nil {
+			log.Debugf("remove operator %v cause region %d is merged", op, op.RegionID)
+			co.removeOperator(op)
+			continue
+		}
+
+		if op.IsTimeout() {
+			log.Infof("[region %v] operator timeout: %s", op.RegionID, op)
+			operatorCounter.WithLabelValues(op.Desc(), "timeout").Inc()
+			co.removeOperator(op)
+		}
+	}
+}
+
 func (c *RaftCluster) storeIsEmpty(storeID uint64) bool {
 	cluster := c.cachedCluster
 	if cluster.getStoreRegionCount(storeID) > 0 {
@@ -461,9 +483,27 @@ func (c *RaftCluster) collectMetrics() {
 	c.coordinator.collectSchedulerMetrics()
 	c.coordinator.collectHotSpotMetrics()
 	cluster.collectMetrics()
+	c.collectHealthStatus()
+}
+
+func (c *RaftCluster) collectHealthStatus() {
+	client := c.s.GetClient()
+	members, err := GetMembers(client)
+	if err != nil {
+		log.Info("get members error:", err)
+	}
+	unhealth := c.s.CheckHealth(members)
+	for _, member := range members {
+		if _, ok := unhealth[member.GetMemberId()]; ok {
+			healthStatusGauge.WithLabelValues(member.GetName()).Set(0)
+			continue
+		}
+		healthStatusGauge.WithLabelValues(member.GetName()).Set(1)
+	}
 }
 
 func (c *RaftCluster) runBackgroundJobs(interval time.Duration) {
+	defer logutil.LogPanic()
 	defer c.wg.Done()
 
 	ticker := time.NewTicker(interval)
@@ -474,6 +514,7 @@ func (c *RaftCluster) runBackgroundJobs(interval time.Duration) {
 		case <-c.quit:
 			return
 		case <-ticker.C:
+			c.checkOperators()
 			c.checkStores()
 			c.collectMetrics()
 			c.coordinator.pruneHistory()

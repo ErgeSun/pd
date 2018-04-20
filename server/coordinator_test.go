@@ -65,8 +65,8 @@ func (c *testClusterInfo) addRegionStore(storeID uint64, regionCount int) {
 	store.LastHeartbeatTS = time.Now()
 	store.RegionCount = regionCount
 	store.RegionSize = int64(regionCount) * 10
-	store.Stats.Capacity = uint64(1024)
-	store.Stats.Available = store.Stats.Capacity
+	store.Stats.Capacity = 1000 * (1 << 20)
+	store.Stats.Available = store.Stats.Capacity - uint64(store.RegionSize)
 	c.putStore(store)
 }
 
@@ -201,10 +201,10 @@ func (s *testCoordinatorSuite) TestDispatch(c *C) {
 
 	// Wait for schedule and turn off balance.
 	waitOperator(c, co, 1)
-	schedulers.CheckTransferPeer(c, co.getOperator(1), 4, 1)
+	schedulers.CheckTransferPeer(c, co.getOperator(1), schedule.OpBalance, 4, 1)
 	c.Assert(co.removeScheduler("balance-region-scheduler"), IsNil)
 	waitOperator(c, co, 2)
-	schedulers.CheckTransferLeader(c, co.getOperator(2), 4, 2)
+	schedulers.CheckTransferLeader(c, co.getOperator(2), schedule.OpBalance, 4, 2)
 	c.Assert(co.removeScheduler("balance-leader-scheduler"), IsNil)
 
 	stream := newMockHeartbeatStream()
@@ -316,7 +316,7 @@ func (s *testCoordinatorSuite) TestPeerState(c *C) {
 
 	// Wait for schedule.
 	waitOperator(c, co, 1)
-	schedulers.CheckTransferPeer(c, co.getOperator(1), 4, 1)
+	schedulers.CheckTransferPeer(c, co.getOperator(1), schedule.OpBalance, 4, 1)
 
 	region := tc.GetRegion(1)
 
@@ -467,34 +467,42 @@ func (s *testCoordinatorSuite) TestPersistScheduler(c *C) {
 	c.Assert(co.schedulers, HasLen, 2)
 	c.Assert(co.cluster.opt.persist(co.cluster.kv), IsNil)
 	co.stop()
-
 	// make a new coordinator for testing
 	// whether the schedulers added or removed in dynamic way are recorded in opt
-	opt.reload(co.cluster.kv)
+	_, newOpt := newTestScheduleConfig()
+	_, err = schedule.CreateScheduler("adjacent-region", co.limiter)
+	c.Assert(err, IsNil)
+	// suppose we add a new default enable scheduler
+	newOpt.AddSchedulerCfg("adjacent-region", []string{})
+	c.Assert(newOpt.GetSchedulers(), HasLen, 5)
+	newOpt.reload(co.cluster.kv)
+	c.Assert(newOpt.GetSchedulers(), HasLen, 7)
+	tc.clusterInfo.opt = newOpt
 
 	co = newCoordinator(tc.clusterInfo, hbStreams, namespace.DefaultClassifier)
 	co.run()
-	c.Assert(co.schedulers, HasLen, 2)
+	c.Assert(co.schedulers, HasLen, 3)
 	bls, err := schedule.CreateScheduler("balance-leader", co.limiter)
 	c.Assert(err, IsNil)
 	c.Assert(co.addScheduler(bls), IsNil)
 	brs, err := schedule.CreateScheduler("balance-region", co.limiter)
 	c.Assert(err, IsNil)
 	c.Assert(co.addScheduler(brs), IsNil)
-	c.Assert(co.schedulers, HasLen, 4)
+	c.Assert(co.schedulers, HasLen, 5)
 	c.Assert(co.removeScheduler("grant-leader-scheduler-1"), IsNil)
-	c.Assert(co.schedulers, HasLen, 3)
+	c.Assert(co.schedulers, HasLen, 4)
 	c.Assert(co.cluster.opt.persist(co.cluster.kv), IsNil)
 	co.stop()
 
 	opt.reload(co.cluster.kv)
+	tc.clusterInfo.opt = opt
 	co = newCoordinator(tc.clusterInfo, hbStreams, namespace.DefaultClassifier)
 
 	co.run()
 	defer co.stop()
-	c.Assert(co.schedulers, HasLen, 3)
+	c.Assert(co.schedulers, HasLen, 4)
 	c.Assert(co.removeScheduler("grant-leader-scheduler-2"), IsNil)
-	c.Assert(co.schedulers, HasLen, 2)
+	c.Assert(co.schedulers, HasLen, 3)
 }
 
 func (s *testCoordinatorSuite) TestRestart(c *C) {
@@ -671,7 +679,7 @@ func waitAddPeer(c *C, stream *mockHeartbeatStream, region *core.RegionInfo, sto
 		}
 		return false
 	})
-	region.Peers = append(region.Peers, res.GetChangePeer().GetPeer())
+	region.AddPeer(res.GetChangePeer().GetPeer())
 	region.RegionEpoch = &metapb.RegionEpoch{
 		ConfVer: region.GetRegionEpoch().GetConfVer() + 1,
 		Version: region.GetRegionEpoch().GetVersion(),

@@ -336,6 +336,9 @@ type ScheduleConfig struct {
 	// it will never be used as a source or target store.
 	MaxSnapshotCount    uint64 `toml:"max-snapshot-count,omitempty" json:"max-snapshot-count"`
 	MaxPendingPeerCount uint64 `toml:"max-pending-peer-count,omitempty" json:"max-pending-peer-count"`
+	// If the size of region is smaller than this value,
+	// it will try to merge with adjacent regions.
+	MaxMergeRegionSize uint64 `toml:"max-merge-region-size,omitempty" json:"max-merge-region-size"`
 	// MaxStoreDownTime is the max duration after which
 	// a store will be considered to be down if it hasn't reported heartbeats.
 	MaxStoreDownTime typeutil.Duration `toml:"max-store-down-time,omitempty" json:"max-store-down-time"`
@@ -345,8 +348,24 @@ type ScheduleConfig struct {
 	RegionScheduleLimit uint64 `toml:"region-schedule-limit,omitempty" json:"region-schedule-limit"`
 	// ReplicaScheduleLimit is the max coexist replica schedules.
 	ReplicaScheduleLimit uint64 `toml:"replica-schedule-limit,omitempty" json:"replica-schedule-limit"`
+	// MergeScheduleLimit is the max coexist merge schedules.
+	MergeScheduleLimit uint64 `toml:"merge-schedule-limit,omitempty" json:"merge-schedule-limit"`
 	// TolerantSizeRatio is the ratio of buffer size for balance scheduler.
 	TolerantSizeRatio float64 `toml:"tolerant-size-ratio,omitempty" json:"tolerant-size-ratio"`
+	//
+	//      high space stage         transition stage           low space stage
+	//   |--------------------|-----------------------------|-------------------------|
+	//   ^                    ^                             ^                         ^
+	//   0       HighSpaceRatio * capacity       LowSpaceRatio * capacity          capacity
+	//
+	// LowSpaceRatio is the lowest usage ratio of store which regraded as low space.
+	// When in low space, store region score increases to very large and varies inversely with available size.
+	LowSpaceRatio float64 `toml:"low-space-ratio,omitempty" json:"low-space-ratio"`
+	// HighSpaceRatio is the highest usage ratio of store which regraded as high space.
+	// High space means there is a lot of spare capacity, and store region score varies directly with used size.
+	HighSpaceRatio float64 `toml:"high-space-ratio,omitempty" json:"high-space-ratio"`
+	// EnableRaftLearner is the option for using AddLearnerNode instead of AddNode
+	EnableRaftLearner bool `toml:"enable-raft-learner" json:"enable-raft-learner,string"`
 	// Schedulers support for loding customized schedulers
 	Schedulers SchedulerConfigs `toml:"schedulers,omitempty" json:"schedulers-v2"` // json v2 is for the sake of compatible upgrade
 }
@@ -356,11 +375,17 @@ func (c *ScheduleConfig) clone() *ScheduleConfig {
 	copy(schedulers, c.Schedulers)
 	return &ScheduleConfig{
 		MaxSnapshotCount:     c.MaxSnapshotCount,
+		MaxPendingPeerCount:  c.MaxPendingPeerCount,
 		MaxStoreDownTime:     c.MaxStoreDownTime,
+		MaxMergeRegionSize:   c.MaxMergeRegionSize,
 		LeaderScheduleLimit:  c.LeaderScheduleLimit,
 		RegionScheduleLimit:  c.RegionScheduleLimit,
 		ReplicaScheduleLimit: c.ReplicaScheduleLimit,
+		MergeScheduleLimit:   c.MergeScheduleLimit,
 		TolerantSizeRatio:    c.TolerantSizeRatio,
+		LowSpaceRatio:        c.LowSpaceRatio,
+		HighSpaceRatio:       c.HighSpaceRatio,
+		EnableRaftLearner:    c.EnableRaftLearner,
 		Schedulers:           schedulers,
 	}
 }
@@ -370,19 +395,24 @@ type SchedulerConfigs []SchedulerConfig
 
 // SchedulerConfig is customized scheduler configuration
 type SchedulerConfig struct {
-	Type string   `toml:"type" json:"type"`
-	Args []string `toml:"args,omitempty" json:"args"`
+	Type    string   `toml:"type" json:"type"`
+	Args    []string `toml:"args,omitempty" json:"args"`
+	Disable bool     `toml:"disable" json:"disable"`
 }
 
 const (
 	defaultMaxReplicas          = 3
 	defaultMaxSnapshotCount     = 3
 	defaultMaxPendingPeerCount  = 16
+	defaultMaxMergeRegionSize   = 0
 	defaultMaxStoreDownTime     = 30 * time.Minute
-	defaultLeaderScheduleLimit  = 64
-	defaultRegionScheduleLimit  = 12
-	defaultReplicaScheduleLimit = 32
-	defaultTolerantSizeRatio    = 2.5
+	defaultLeaderScheduleLimit  = 4
+	defaultRegionScheduleLimit  = 4
+	defaultReplicaScheduleLimit = 8
+	defaultMergeScheduleLimit   = 8
+	defaultTolerantSizeRatio    = 5
+	defaultLowSpaceRatio        = 0.8
+	defaultHighSpaceRatio       = 0.6
 )
 
 var defaultSchedulers = SchedulerConfigs{
@@ -396,10 +426,14 @@ func (c *ScheduleConfig) adjust() {
 	adjustUint64(&c.MaxSnapshotCount, defaultMaxSnapshotCount)
 	adjustUint64(&c.MaxPendingPeerCount, defaultMaxPendingPeerCount)
 	adjustDuration(&c.MaxStoreDownTime, defaultMaxStoreDownTime)
+	adjustUint64(&c.MaxMergeRegionSize, defaultMaxMergeRegionSize)
 	adjustUint64(&c.LeaderScheduleLimit, defaultLeaderScheduleLimit)
 	adjustUint64(&c.RegionScheduleLimit, defaultRegionScheduleLimit)
 	adjustUint64(&c.ReplicaScheduleLimit, defaultReplicaScheduleLimit)
+	adjustUint64(&c.MergeScheduleLimit, defaultMergeScheduleLimit)
 	adjustFloat64(&c.TolerantSizeRatio, defaultTolerantSizeRatio)
+	adjustFloat64(&c.LowSpaceRatio, defaultLowSpaceRatio)
+	adjustFloat64(&c.HighSpaceRatio, defaultHighSpaceRatio)
 	adjustSchedulers(&c.Schedulers, defaultSchedulers)
 }
 
@@ -436,6 +470,8 @@ type NamespaceConfig struct {
 	RegionScheduleLimit uint64 `json:"region-schedule-limit"`
 	// ReplicaScheduleLimit is the max coexist replica schedules.
 	ReplicaScheduleLimit uint64 `json:"replica-schedule-limit"`
+	// MergeScheduleLimit is the max coexist merge schedules.
+	MergeScheduleLimit uint64 `json:"merge-schedule-limit"`
 	// MaxReplicas is the number of replicas for each region.
 	MaxReplicas uint64 `json:"max-replicas"`
 }
@@ -445,6 +481,7 @@ func (c *NamespaceConfig) clone() *NamespaceConfig {
 		LeaderScheduleLimit:  c.LeaderScheduleLimit,
 		RegionScheduleLimit:  c.RegionScheduleLimit,
 		ReplicaScheduleLimit: c.ReplicaScheduleLimit,
+		MergeScheduleLimit:   c.MergeScheduleLimit,
 		MaxReplicas:          c.MaxReplicas,
 	}
 }
@@ -453,6 +490,7 @@ func (c *NamespaceConfig) adjust(opt *scheduleOption) {
 	adjustUint64(&c.LeaderScheduleLimit, opt.GetLeaderScheduleLimit(namespace.DefaultNamespace))
 	adjustUint64(&c.RegionScheduleLimit, opt.GetRegionScheduleLimit(namespace.DefaultNamespace))
 	adjustUint64(&c.ReplicaScheduleLimit, opt.GetReplicaScheduleLimit(namespace.DefaultNamespace))
+	adjustUint64(&c.MergeScheduleLimit, opt.GetMergeScheduleLimit(namespace.DefaultNamespace))
 	adjustUint64(&c.MaxReplicas, uint64(opt.GetMaxReplicas(namespace.DefaultNamespace)))
 }
 

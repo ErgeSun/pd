@@ -57,17 +57,29 @@ func (r *ReplicaChecker) Check(region *core.RegionInfo) *Operator {
 
 	if len(region.GetPeers()) < r.cluster.GetMaxReplicas() {
 		log.Debugf("[region %d] has %d peers fewer than max replicas", region.GetId(), len(region.GetPeers()))
-		newPeer := r.SelectBestPeerToAddReplica(region, r.filters...)
+		newPeer, _ := r.selectBestPeerToAddReplica(region)
 		if newPeer == nil {
 			checkerCounter.WithLabelValues("replica_checker", "no_target_store").Inc()
 			return nil
 		}
-		step := AddPeer{ToStore: newPeer.GetStoreId(), PeerID: newPeer.GetId()}
+		var steps []OperatorStep
+		if r.cluster.IsRaftLearnerEnabled() {
+			steps = []OperatorStep{
+				AddLearner{ToStore: newPeer.GetStoreId(), PeerID: newPeer.GetId()},
+				PromoteLearner{ToStore: newPeer.GetStoreId(), PeerID: newPeer.GetId()},
+			}
+		} else {
+			steps = []OperatorStep{
+				AddPeer{ToStore: newPeer.GetStoreId(), PeerID: newPeer.GetId()},
+			}
+		}
 		checkerCounter.WithLabelValues("replica_checker", "new_operator").Inc()
-		return NewOperator("makeUpReplica", region.GetId(), OpReplica|OpRegion, step)
+		return NewOperator("makeUpReplica", region.GetId(), OpReplica|OpRegion, steps...)
 	}
 
-	if len(region.GetPeers()) > r.cluster.GetMaxReplicas() {
+	// when add learner peer, the number of peer will exceed max replicas for a wille,
+	// just comparing the the number of voters to avoid too many cancel add operator log.
+	if len(region.GetVoters()) > r.cluster.GetMaxReplicas() {
 		log.Debugf("[region %d] has %d peers more than max replicas", region.GetId(), len(region.GetPeers()))
 		oldPeer, _ := r.selectWorstPeer(region)
 		if oldPeer == nil {
@@ -81,34 +93,41 @@ func (r *ReplicaChecker) Check(region *core.RegionInfo) *Operator {
 	return r.checkBestReplacement(region)
 }
 
-// SelectBestPeerToAddReplica returns a new peer that to be used to add a replica.
-func (r *ReplicaChecker) SelectBestPeerToAddReplica(region *core.RegionInfo, filters ...Filter) *metapb.Peer {
-	storeID, _ := r.SelectBestStoreToAddReplica(region, filters...)
+// SelectBestReplacementStore returns a store id that to be used to replace the old peer and distinct score.
+func (r *ReplicaChecker) SelectBestReplacementStore(region *core.RegionInfo, oldPeer *metapb.Peer, filters ...Filter) (uint64, float64) {
+	filters = append(filters, NewExcludedFilter(nil, region.GetStoreIds()))
+	newRegion := region.Clone()
+	newRegion.RemoveStorePeer(oldPeer.GetStoreId())
+	return r.selectBestStoreToAddReplica(newRegion, filters...)
+}
+
+// selectBestPeerToAddReplica returns a new peer that to be used to add a replica and distinct score.
+func (r *ReplicaChecker) selectBestPeerToAddReplica(region *core.RegionInfo, filters ...Filter) (*metapb.Peer, float64) {
+	storeID, score := r.selectBestStoreToAddReplica(region, filters...)
 	if storeID == 0 {
 		log.Debugf("[region %d] no best store to add replica", region.GetId())
-		return nil
+		return nil, 0
 	}
 	newPeer, err := r.cluster.AllocPeer(storeID)
 	if err != nil {
-		return nil
+		return nil, 0
 	}
-	return newPeer
+	return newPeer, score
 }
 
-// SelectBestStoreToAddReplica returns the store to add a replica.
-func (r *ReplicaChecker) SelectBestStoreToAddReplica(region *core.RegionInfo, filters ...Filter) (uint64, float64) {
+// selectBestStoreToAddReplica returns the store to add a replica.
+func (r *ReplicaChecker) selectBestStoreToAddReplica(region *core.RegionInfo, filters ...Filter) (uint64, float64) {
 	// Add some must have filters.
 	newFilters := []Filter{
 		NewStateFilter(),
-		NewStorageThresholdFilter(),
+		NewPendingPeerCountFilter(),
 		NewExcludedFilter(nil, region.GetStoreIds()),
 	}
+	filters = append(filters, r.filters...)
 	filters = append(filters, newFilters...)
-
 	if r.classifier != nil {
 		filters = append(filters, NewNamespaceFilter(r.classifier, r.classifier.GetRegionNamespace(region)))
 	}
-
 	regionStores := r.cluster.GetRegionStores(region)
 	selector := NewReplicaSelector(regionStores, r.cluster.GetLocationLabels(), r.filters...)
 	target := selector.SelectTarget(r.cluster, r.cluster.GetStores(), filters...)
@@ -128,14 +147,6 @@ func (r *ReplicaChecker) selectWorstPeer(region *core.RegionInfo) (*metapb.Peer,
 		return nil, 0
 	}
 	return region.GetStorePeer(worstStore.GetId()), DistinctScore(r.cluster.GetLocationLabels(), regionStores, worstStore)
-}
-
-// selectBestReplacement returns the best store to replace the region peer.
-func (r *ReplicaChecker) selectBestReplacement(region *core.RegionInfo, peer *metapb.Peer) (uint64, float64) {
-	// Get a new region without the peer we are going to replace.
-	newRegion := region.Clone()
-	newRegion.RemoveStorePeer(peer.GetStoreId())
-	return r.SelectBestStoreToAddReplica(newRegion, NewExcludedFilter(nil, region.GetStoreIds()))
 }
 
 func (r *ReplicaChecker) checkDownPeer(region *core.RegionInfo) *Operator {
@@ -161,6 +172,11 @@ func (r *ReplicaChecker) checkDownPeer(region *core.RegionInfo) *Operator {
 }
 
 func (r *ReplicaChecker) checkOfflinePeer(region *core.RegionInfo) *Operator {
+	// just skip learner
+	if len(region.Learners) != 0 {
+		return nil
+	}
+
 	for _, peer := range region.GetPeers() {
 		store := r.cluster.GetStore(peer.GetStoreId())
 		if store == nil {
@@ -184,9 +200,13 @@ func (r *ReplicaChecker) checkOfflinePeer(region *core.RegionInfo) *Operator {
 			return CreateRemovePeerOperator("removePendingOfflineReplica", r.cluster, OpReplica, region, peer.GetStoreId())
 		}
 
-		newPeer := r.SelectBestPeerToAddReplica(region)
-		if newPeer == nil {
-			log.Debugf("[region %d] no best peer to add replica", region.GetId())
+		storeID, _ := r.SelectBestReplacementStore(region, peer)
+		if storeID == 0 {
+			log.Debugf("[region %d] no best store to add replica", region.GetId())
+			return nil
+		}
+		newPeer, err := r.cluster.AllocPeer(storeID)
+		if err != nil {
 			return nil
 		}
 		return CreateMovePeerOperator("makeUpOfflineReplica", r.cluster, region, OpReplica, peer.GetStoreId(), newPeer.GetStoreId(), newPeer.GetId())
@@ -198,18 +218,18 @@ func (r *ReplicaChecker) checkOfflinePeer(region *core.RegionInfo) *Operator {
 func (r *ReplicaChecker) checkBestReplacement(region *core.RegionInfo) *Operator {
 	oldPeer, oldScore := r.selectWorstPeer(region)
 	if oldPeer == nil {
-		checkerCounter.WithLabelValues("replica_checker", "all_right")
+		checkerCounter.WithLabelValues("replica_checker", "all_right").Inc()
 		return nil
 	}
-	storeID, newScore := r.selectBestReplacement(region, oldPeer)
+	storeID, newScore := r.SelectBestReplacementStore(region, oldPeer)
 	if storeID == 0 {
-		checkerCounter.WithLabelValues("replica_checker", "no_replacement_store")
+		checkerCounter.WithLabelValues("replica_checker", "no_replacement_store").Inc()
 		return nil
 	}
 	// Make sure the new peer is better than the old peer.
 	if newScore <= oldScore {
 		log.Debugf("[region %d] newScore %f is not better than oldScore %f", region.GetId(), newScore, oldScore)
-		checkerCounter.WithLabelValues("replica_checker", "not_better")
+		checkerCounter.WithLabelValues("replica_checker", "not_better").Inc()
 		return nil
 	}
 	newPeer, err := r.cluster.AllocPeer(storeID)
@@ -217,5 +237,5 @@ func (r *ReplicaChecker) checkBestReplacement(region *core.RegionInfo) *Operator
 		return nil
 	}
 	checkerCounter.WithLabelValues("replica_checker", "new_operator").Inc()
-	return CreateMovePeerOperator("moveToBetterLocation", r.cluster, region, OpReplica, oldPeer.GetStoreId(), storeID, newPeer.GetId())
+	return CreateMovePeerOperator("moveToBetterLocation", r.cluster, region, OpReplica, oldPeer.GetStoreId(), newPeer.GetStoreId(), newPeer.GetId())
 }

@@ -84,6 +84,10 @@ func (o *scheduleOption) GetMaxStoreDownTime() time.Duration {
 	return o.load().MaxStoreDownTime.Duration
 }
 
+func (o *scheduleOption) GetMaxMergeRegionSize() uint64 {
+	return o.load().MaxMergeRegionSize
+}
+
 func (o *scheduleOption) GetLeaderScheduleLimit(name string) uint64 {
 	if n, ok := o.ns[name]; ok {
 		return n.GetLeaderScheduleLimit()
@@ -105,8 +109,27 @@ func (o *scheduleOption) GetReplicaScheduleLimit(name string) uint64 {
 	return o.load().ReplicaScheduleLimit
 }
 
+func (o *scheduleOption) GetMergeScheduleLimit(name string) uint64 {
+	if n, ok := o.ns[name]; ok {
+		return n.GetMergeScheduleLimit()
+	}
+	return o.load().MergeScheduleLimit
+}
+
 func (o *scheduleOption) GetTolerantSizeRatio() float64 {
 	return o.load().TolerantSizeRatio
+}
+
+func (o *scheduleOption) GetLowSpaceRatio() float64 {
+	return o.load().LowSpaceRatio
+}
+
+func (o *scheduleOption) GetHighSpaceRatio() float64 {
+	return o.load().HighSpaceRatio
+}
+
+func (o *scheduleOption) IsRaftLearnerEnabled() bool {
+	return o.load().EnableRaftLearner
 }
 
 func (o *scheduleOption) GetSchedulers() SchedulerConfigs {
@@ -116,15 +139,22 @@ func (o *scheduleOption) GetSchedulers() SchedulerConfigs {
 func (o *scheduleOption) AddSchedulerCfg(tp string, args []string) error {
 	c := o.load()
 	v := c.clone()
-	for _, schedulerCfg := range v.Schedulers {
+	for i, schedulerCfg := range v.Schedulers {
 		// comparing args is to cover the case that there are schedulers in same type but not with same name
 		// such as two schedulers of type "evict-leader",
 		// one name is "evict-leader-scheduler-1" and the other is "evict-leader-scheduler-2"
-		if reflect.DeepEqual(schedulerCfg, SchedulerConfig{tp, args}) {
+		if reflect.DeepEqual(schedulerCfg, SchedulerConfig{Type: tp, Args: args, Disable: false}) {
+			return nil
+		}
+
+		if reflect.DeepEqual(schedulerCfg, SchedulerConfig{Type: tp, Args: args, Disable: true}) {
+			schedulerCfg.Disable = false
+			v.Schedulers[i] = schedulerCfg
+			o.store(v)
 			return nil
 		}
 	}
-	v.Schedulers = append(v.Schedulers, SchedulerConfig{Type: tp, Args: args})
+	v.Schedulers = append(v.Schedulers, SchedulerConfig{Type: tp, Args: args, Disable: false})
 	o.store(v)
 	return nil
 }
@@ -139,7 +169,8 @@ func (o *scheduleOption) RemoveSchedulerCfg(name string) error {
 			return errors.Trace(err)
 		}
 		if tmp.GetName() == name {
-			v.Schedulers = append(v.Schedulers[:i], v.Schedulers[i+1:]...)
+			schedulerCfg.Disable = true
+			v.Schedulers[i] = schedulerCfg
 			o.store(v)
 			return nil
 		}
@@ -199,7 +230,7 @@ func (o *scheduleOption) reload(kv *core.KV) error {
 		namespaces[name] = *ns.load()
 	}
 	cfg := &Config{
-		Schedule:      *o.load(),
+		Schedule:      *o.load().clone(),
 		Replication:   *o.rep.load(),
 		Namespace:     namespaces,
 		LabelProperty: o.loadLabelPropertyConfig().clone(),
@@ -208,6 +239,7 @@ func (o *scheduleOption) reload(kv *core.KV) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	o.adjustScheduleCfg(cfg)
 	if isExist {
 		o.store(&cfg.Schedule)
 		o.rep.store(&cfg.Replication)
@@ -218,6 +250,33 @@ func (o *scheduleOption) reload(kv *core.KV) error {
 		o.labelProperty.Store(cfg.LabelProperty)
 	}
 	return nil
+}
+
+func (o *scheduleOption) adjustScheduleCfg(persistentCfg *Config) {
+	scheduleCfg := *o.load()
+	for i, s := range scheduleCfg.Schedulers {
+		for _, ps := range persistentCfg.Schedule.Schedulers {
+			if s.Type == ps.Type && reflect.DeepEqual(s.Args, ps.Args) {
+				scheduleCfg.Schedulers[i].Disable = ps.Disable
+				break
+			}
+		}
+	}
+	restoredSchedulers := make([]SchedulerConfig, 0, len(persistentCfg.Schedule.Schedulers))
+	for _, ps := range persistentCfg.Schedule.Schedulers {
+		needRestore := true
+		for _, s := range scheduleCfg.Schedulers {
+			if s.Type == ps.Type && reflect.DeepEqual(s.Args, ps.Args) {
+				needRestore = false
+				break
+			}
+		}
+		if needRestore {
+			restoredSchedulers = append(restoredSchedulers, ps)
+		}
+	}
+	scheduleCfg.Schedulers = append(scheduleCfg.Schedulers, restoredSchedulers...)
+	persistentCfg.Schedule.Schedulers = scheduleCfg.Schedulers
 }
 
 func (o *scheduleOption) GetHotRegionLowThreshold() int {
@@ -297,17 +356,22 @@ func (n *namespaceOption) GetMaxReplicas() int {
 	return int(n.load().MaxReplicas)
 }
 
-// GetLeaderScheduleLimit returns the number of replicas for each region.
+// GetLeaderScheduleLimit returns the limit for leader schedule.
 func (n *namespaceOption) GetLeaderScheduleLimit() uint64 {
 	return n.load().LeaderScheduleLimit
 }
 
-// GetRegionScheduleLimit returns the number of replicas for each region.
+// GetRegionScheduleLimit returns the limit for region schedule.
 func (n *namespaceOption) GetRegionScheduleLimit() uint64 {
 	return n.load().RegionScheduleLimit
 }
 
-// GetReplicaScheduleLimit returns the number of replicas for each region.
+// GetReplicaScheduleLimit returns the limit for replica schedule.
 func (n *namespaceOption) GetReplicaScheduleLimit() uint64 {
 	return n.load().ReplicaScheduleLimit
+}
+
+// GetMergeScheduleLimit returns the limit for merge schedule.
+func (n *namespaceOption) GetMergeScheduleLimit() uint64 {
+	return n.load().MergeScheduleLimit
 }

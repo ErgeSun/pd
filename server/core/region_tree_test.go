@@ -93,9 +93,9 @@ func (s *testRegionSuite) TestRegionInfo(c *C) {
 func (s *testRegionSuite) TestRegionItem(c *C) {
 	item := newRegionItem([]byte("b"), []byte{})
 
-	c.Assert(item.Less(newRegionItem([]byte("a"), []byte{})), IsTrue)
+	c.Assert(item.Less(newRegionItem([]byte("a"), []byte{})), IsFalse)
 	c.Assert(item.Less(newRegionItem([]byte("b"), []byte{})), IsFalse)
-	c.Assert(item.Less(newRegionItem([]byte("c"), []byte{})), IsFalse)
+	c.Assert(item.Less(newRegionItem([]byte("c"), []byte{})), IsTrue)
 
 	c.Assert(item.Contains([]byte("a")), IsFalse)
 	c.Assert(item.Contains([]byte("b")), IsTrue)
@@ -134,6 +134,20 @@ func (s *testRegionSuite) TestRegionTree(c *C) {
 	c.Assert(tree.search([]byte("b")), Equals, regionB)
 	c.Assert(tree.search([]byte("c")), IsNil)
 	c.Assert(tree.search([]byte("d")), Equals, regionD)
+
+	// check get adjacent regions
+	prev, next := tree.getAdjacentRegions(regionA)
+	c.Assert(prev, IsNil)
+	c.Assert(next.region, Equals, regionB)
+	prev, next = tree.getAdjacentRegions(regionB)
+	c.Assert(prev.region, Equals, regionA)
+	c.Assert(next.region, Equals, regionD)
+	prev, next = tree.getAdjacentRegions(regionC)
+	c.Assert(prev.region, Equals, regionB)
+	c.Assert(next.region, Equals, regionD)
+	prev, next = tree.getAdjacentRegions(regionD)
+	c.Assert(prev.region, Equals, regionB)
+	c.Assert(next, IsNil)
 
 	// region with the same range and different region id will not be delete.
 	region0 := newRegionItem([]byte{}, []byte("a")).region

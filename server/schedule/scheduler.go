@@ -25,8 +25,8 @@ import (
 
 // Cluster provides an overview of a cluster's regions distribution.
 type Cluster interface {
-	RandFollowerRegion(storeID uint64) *core.RegionInfo
-	RandLeaderRegion(storeID uint64) *core.RegionInfo
+	RandFollowerRegion(storeID uint64, opts ...core.RegionOption) *core.RegionInfo
+	RandLeaderRegion(storeID uint64, opts ...core.RegionOption) *core.RegionInfo
 
 	GetStores() []*core.StoreInfo
 	GetStore(id uint64) *core.StoreInfo
@@ -34,7 +34,7 @@ type Cluster interface {
 	GetRegionStores(region *core.RegionInfo) []*core.StoreInfo
 	GetFollowerStores(region *core.RegionInfo) []*core.StoreInfo
 	GetLeaderStore(region *core.RegionInfo) *core.StoreInfo
-	GetStoresAverageScore(kind core.ResourceKind, filters ...Filter) float64
+	GetAdjacentRegions(region *core.RegionInfo) (*core.RegionInfo, *core.RegionInfo)
 	ScanRegions(startKey []byte, limit int) []*core.RegionInfo
 
 	BlockStore(id uint64) error
@@ -43,6 +43,7 @@ type Cluster interface {
 	IsRegionHot(id uint64) bool
 	RegionWriteStats() []*core.RegionStat
 	RegionReadStats() []*core.RegionStat
+	RandHotRegionFromStore(store uint64, kind FlowKind) *core.RegionInfo
 
 	// get config methods
 	GetOpt() NamespaceOptions
@@ -62,7 +63,7 @@ type Scheduler interface {
 	GetNextInterval(interval time.Duration) time.Duration
 	Prepare(cluster Cluster) error
 	Cleanup(cluster Cluster)
-	Schedule(cluster Cluster, opInfluence OpInfluence) *Operator
+	Schedule(cluster Cluster, opInfluence OpInfluence) []*Operator
 	IsScheduleAllowed(cluster Cluster) bool
 }
 

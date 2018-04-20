@@ -48,12 +48,11 @@ func newRegionInfo(r *core.RegionInfo) *regionInfo {
 		return nil
 	}
 	return &regionInfo{
-		ID:          r.Id,
-		StartKey:    strings.Trim(fmt.Sprintf("%q", r.StartKey), "\""),
-		EndKey:      strings.Trim(fmt.Sprintf("%q", r.EndKey), "\""),
-		RegionEpoch: r.RegionEpoch,
-		Peers:       r.Peers,
-
+		ID:              r.Id,
+		StartKey:        strings.Trim(fmt.Sprintf("%q", r.StartKey), "\""),
+		EndKey:          strings.Trim(fmt.Sprintf("%q", r.EndKey), "\""),
+		RegionEpoch:     r.RegionEpoch,
+		Peers:           r.Peers,
 		Leader:          r.Leader,
 		DownPeers:       r.DownPeers,
 		PendingPeers:    r.PendingPeers,
@@ -189,6 +188,30 @@ func (h *regionsHandler) GetIncorrectNamespaceRegions(w http.ResponseWriter, r *
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.rd.JSON(w, http.StatusOK, res)
+}
+
+func (h *regionsHandler) GetRegionSiblings(w http.ResponseWriter, r *http.Request) {
+	cluster := h.svr.GetRaftCluster()
+	if cluster == nil {
+		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
+		return
+	}
+
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	region := cluster.GetRegionInfoByID(uint64(id))
+	if region == nil {
+		h.rd.JSON(w, http.StatusInternalServerError, server.ErrRegionNotFound(uint64(id)).Error())
+		return
+	}
+
+	left, right := cluster.GetAdjacentRegions(region)
+	res := []*regionInfo{newRegionInfo(left), newRegionInfo(right)}
 	h.rd.JSON(w, http.StatusOK, res)
 }
 

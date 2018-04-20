@@ -28,17 +28,22 @@ type Options interface {
 	GetLeaderScheduleLimit() uint64
 	GetRegionScheduleLimit() uint64
 	GetReplicaScheduleLimit() uint64
+	GetMergeScheduleLimit() uint64
 
 	GetMaxSnapshotCount() uint64
 	GetMaxPendingPeerCount() uint64
 	GetMaxStoreDownTime() time.Duration
+	GetMaxMergeRegionSize() uint64
 
 	GetMaxReplicas() int
 	GetLocationLabels() []string
 
 	GetHotRegionLowThreshold() int
 	GetTolerantSizeRatio() float64
+	GetLowSpaceRatio() float64
+	GetHighSpaceRatio() float64
 
+	IsRaftLearnerEnabled() bool
 	CheckLabelProperty(typ string, labels []*metapb.StoreLabel) bool
 }
 
@@ -47,6 +52,7 @@ type NamespaceOptions interface {
 	GetLeaderScheduleLimit(name string) uint64
 	GetRegionScheduleLimit(name string) uint64
 	GetReplicaScheduleLimit(name string) uint64
+	GetMergeScheduleLimit(name string) uint64
 	GetMaxReplicas(name string) int
 }
 

@@ -14,16 +14,22 @@
 package schedule
 
 import (
+	"bytes"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"time"
+
+	"github.com/juju/errors"
+	"github.com/pingcap/kvproto/pkg/metapb"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/pingcap/pd/server/core"
 )
 
 // MaxOperatorWaitTime is the duration that if an operator lives longer that it,
 // the operator is considered timeout.
-const MaxOperatorWaitTime = 5 * time.Minute
+const MaxOperatorWaitTime = 10 * time.Minute
 
 // OperatorStep describes the basic scheduling steps that can not be subdivided.
 type OperatorStep interface {
@@ -51,9 +57,9 @@ func (tl TransferLeader) Influence(opInfluence OpInfluence, region *core.RegionI
 	from := opInfluence.GetStoreInfluence(tl.FromStore)
 	to := opInfluence.GetStoreInfluence(tl.ToStore)
 
-	from.LeaderSize -= int(region.ApproximateSize)
+	from.LeaderSize -= region.ApproximateSize
 	from.LeaderCount--
-	to.LeaderSize += int(region.ApproximateSize)
+	to.LeaderSize += region.ApproximateSize
 	to.LeaderCount++
 }
 
@@ -68,8 +74,12 @@ func (ap AddPeer) String() string {
 
 // IsFinish checks if current step is finished.
 func (ap AddPeer) IsFinish(region *core.RegionInfo) bool {
-	if p := region.GetStorePeer(ap.ToStore); p != nil {
-		return region.GetPendingPeer(p.GetId()) == nil
+	if p := region.GetStoreVoter(ap.ToStore); p != nil {
+		if p.GetId() != ap.PeerID {
+			log.Warnf("expect %v, but obtain voter %v", ap.String(), p.GetId())
+			return false
+		}
+		return region.GetPendingVoter(p.GetId()) == nil
 	}
 	return false
 }
@@ -78,9 +88,61 @@ func (ap AddPeer) IsFinish(region *core.RegionInfo) bool {
 func (ap AddPeer) Influence(opInfluence OpInfluence, region *core.RegionInfo) {
 	to := opInfluence.GetStoreInfluence(ap.ToStore)
 
-	to.RegionSize += int(region.ApproximateSize)
+	to.RegionSize += region.ApproximateSize
 	to.RegionCount++
 }
+
+// AddLearner is an OperatorStep that adds a region learner peer.
+type AddLearner struct {
+	ToStore, PeerID uint64
+}
+
+func (al AddLearner) String() string {
+	return fmt.Sprintf("add learner peer %v on store %v", al.PeerID, al.ToStore)
+}
+
+// IsFinish checks if current step is finished.
+func (al AddLearner) IsFinish(region *core.RegionInfo) bool {
+	if p := region.GetStoreLearner(al.ToStore); p != nil {
+		if p.GetId() != al.PeerID {
+			log.Warnf("expect %v, but obtain learner %v", al.String(), p.GetId())
+			return false
+		}
+		return region.GetPendingLearner(p.GetId()) == nil
+	}
+	return false
+}
+
+// Influence calculates the store difference that current step make
+func (al AddLearner) Influence(opInfluence OpInfluence, region *core.RegionInfo) {
+	to := opInfluence.GetStoreInfluence(al.ToStore)
+
+	to.RegionSize += region.ApproximateSize
+	to.RegionCount++
+}
+
+// PromoteLearner is an OperatorStep that promotes a region learner peer to normal voter.
+type PromoteLearner struct {
+	ToStore, PeerID uint64
+}
+
+func (pl PromoteLearner) String() string {
+	return fmt.Sprintf("promote learner peer %v on store %v to voter", pl.PeerID, pl.ToStore)
+}
+
+// IsFinish checks if current step is finished.
+func (pl PromoteLearner) IsFinish(region *core.RegionInfo) bool {
+	if p := region.GetStoreVoter(pl.ToStore); p != nil {
+		if p.GetId() != pl.PeerID {
+			log.Warnf("expect %v, but obtain voter %v", pl.String(), p.GetId())
+		}
+		return p.GetId() == pl.PeerID
+	}
+	return false
+}
+
+// Influence calculates the store difference that current step make
+func (pl PromoteLearner) Influence(opInfluence OpInfluence, region *core.RegionInfo) {}
 
 // RemovePeer is an OperatorStep that removes a region peer.
 type RemovePeer struct {
@@ -100,8 +162,71 @@ func (rp RemovePeer) IsFinish(region *core.RegionInfo) bool {
 func (rp RemovePeer) Influence(opInfluence OpInfluence, region *core.RegionInfo) {
 	from := opInfluence.GetStoreInfluence(rp.FromStore)
 
-	from.RegionSize -= int(region.ApproximateSize)
+	from.RegionSize -= region.ApproximateSize
 	from.RegionCount--
+}
+
+// MergeRegion is an OperatorStep that merge two regions.
+type MergeRegion struct {
+	FromRegion *metapb.Region
+	ToRegion   *metapb.Region
+	// there are two regions involved in merge process,
+	// so to keep them from other scheduler,
+	// both of them should add MerRegion operatorStep.
+	// But actually, tikv just need the region want to be merged to get the merge request,
+	// thus use a IsPssive mark to indicate that
+	// this region doesn't need to send merge request to tikv.
+	IsPassive bool
+}
+
+func (mr MergeRegion) String() string {
+	return fmt.Sprintf("merge region %v into region %v", mr.FromRegion.GetId(), mr.ToRegion.GetId())
+}
+
+// IsFinish checks if current step is finished
+func (mr MergeRegion) IsFinish(region *core.RegionInfo) bool {
+	if mr.IsPassive {
+		return bytes.Compare(region.Region.StartKey, mr.ToRegion.StartKey) != 0 || bytes.Compare(region.Region.EndKey, mr.ToRegion.EndKey) != 0
+	}
+	return false
+}
+
+// Influence calculates the store difference that current step make
+func (mr MergeRegion) Influence(opInfluence OpInfluence, region *core.RegionInfo) {
+	if mr.IsPassive {
+		for _, p := range region.GetPeers() {
+			o := opInfluence.GetStoreInfluence(p.GetStoreId())
+			o.RegionCount--
+			if region.Leader.GetId() == p.GetId() {
+				o.LeaderCount--
+			}
+		}
+	}
+}
+
+// SplitRegion is an OperatorStep that splits a region.
+type SplitRegion struct {
+	StartKey, EndKey []byte
+}
+
+func (sr SplitRegion) String() string {
+	return "split region"
+}
+
+// IsFinish checks if current step is finished.
+func (sr SplitRegion) IsFinish(region *core.RegionInfo) bool {
+	return !bytes.Equal(region.StartKey, sr.StartKey) || !bytes.Equal(region.EndKey, sr.EndKey)
+}
+
+// Influence calculates the store difference that current step make.
+func (sr SplitRegion) Influence(opInfluence OpInfluence, region *core.RegionInfo) {
+	for _, p := range region.Peers {
+		inf := opInfluence.GetStoreInfluence(p.GetStoreId())
+		inf.RegionCount++
+		if region.Leader.GetId() == p.GetId() {
+			inf.LeaderCount++
+		}
+	}
 }
 
 // Operator contains execution steps generated by scheduler.
@@ -112,6 +237,7 @@ type Operator struct {
 	steps       []OperatorStep
 	currentStep int32
 	createTime  time.Time
+	stepTime    int64
 	level       core.PriorityLevel
 }
 
@@ -123,6 +249,7 @@ func NewOperator(desc string, regionID uint64, kind OperatorKind, steps ...Opera
 		kind:       kind,
 		steps:      steps,
 		createTime: time.Now(),
+		stepTime:   time.Now().UnixNano(),
 		level:      core.NormalPriority,
 	}
 }
@@ -181,7 +308,10 @@ func (o *Operator) Step(i int) OperatorStep {
 func (o *Operator) Check(region *core.RegionInfo) OperatorStep {
 	for step := atomic.LoadInt32(&o.currentStep); int(step) < len(o.steps); step++ {
 		if o.steps[int(step)].IsFinish(region) {
+			operatorStepDuration.WithLabelValues(reflect.TypeOf(o.steps[int(step)]).Name()).
+				Observe(time.Since(time.Unix(0, atomic.LoadInt64(&o.stepTime))).Seconds())
 			atomic.StoreInt32(&o.currentStep, step+1)
+			atomic.StoreInt64(&o.stepTime, time.Now().UnixNano())
 		} else {
 			return o.steps[int(step)]
 		}
@@ -263,16 +393,26 @@ func (o *Operator) History() []OperatorHistory {
 
 // CreateRemovePeerOperator creates an Operator that removes a peer from region.
 func CreateRemovePeerOperator(desc string, cluster Cluster, kind OperatorKind, region *core.RegionInfo, storeID uint64) *Operator {
-	kind, steps := removePeerSteps(cluster, region, storeID)
-	return NewOperator(desc, region.GetId(), kind, steps...)
+	removeKind, steps := removePeerSteps(cluster, region, storeID)
+	return NewOperator(desc, region.GetId(), removeKind|kind, steps...)
 }
 
-// CreateMovePeerOperator creates an Operator that replaces an old peer with a
-// new peer
+// CreateMovePeerOperator creates an Operator that replaces an old peer with a new peer.
 func CreateMovePeerOperator(desc string, cluster Cluster, region *core.RegionInfo, kind OperatorKind, oldStore, newStore uint64, peerID uint64) *Operator {
-	kind, steps := removePeerSteps(cluster, region, oldStore)
-	steps = append([]OperatorStep{AddPeer{ToStore: newStore, PeerID: peerID}}, steps...)
-	return NewOperator(desc, region.GetId(), kind|OpRegion, steps...)
+	removeKind, steps := removePeerSteps(cluster, region, oldStore)
+	var st []OperatorStep
+	if cluster.IsRaftLearnerEnabled() {
+		st = []OperatorStep{
+			AddLearner{ToStore: newStore, PeerID: peerID},
+			PromoteLearner{ToStore: newStore, PeerID: peerID},
+		}
+	} else {
+		st = []OperatorStep{
+			AddPeer{ToStore: newStore, PeerID: peerID},
+		}
+	}
+	steps = append(st, steps...)
+	return NewOperator(desc, region.GetId(), removeKind|kind|OpRegion, steps...)
 }
 
 // removePeerSteps returns the steps to safely remove a peer. It prevents removing leader by transfer its leadership first.
@@ -290,4 +430,106 @@ func removePeerSteps(cluster Cluster, region *core.RegionInfo, storeID uint64) (
 	steps = append(steps, RemovePeer{FromStore: storeID})
 	kind |= OpRegion
 	return
+}
+
+// CreateMergeRegionOperator creates an Operator that merge two region into one
+func CreateMergeRegionOperator(desc string, cluster Cluster, source *core.RegionInfo, target *core.RegionInfo, kind OperatorKind) (*Operator, *Operator, error) {
+	steps, kinds, err := matchPeerSteps(cluster, source, target)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+
+	steps = append(steps, MergeRegion{
+		FromRegion: source.Region,
+		ToRegion:   target.Region,
+		IsPassive:  false,
+	})
+
+	op1 := NewOperator(desc, source.GetId(), kinds|kind, steps...)
+	op2 := NewOperator(desc, target.GetId(), kind, MergeRegion{
+		FromRegion: source.Region,
+		ToRegion:   target.Region,
+		IsPassive:  true,
+	})
+
+	return op1, op2, nil
+}
+
+// matchPeerSteps returns the steps to match the location of peer stores of source region with target's.
+func matchPeerSteps(cluster Cluster, source *core.RegionInfo, target *core.RegionInfo) ([]OperatorStep, OperatorKind, error) {
+	storeIDs := make(map[uint64]struct{})
+	var steps []OperatorStep
+	var kind OperatorKind
+
+	sourcePeers := source.Region.GetPeers()
+	targetPeers := target.Region.GetPeers()
+
+	for _, peer := range targetPeers {
+		storeIDs[peer.GetStoreId()] = struct{}{}
+	}
+
+	// Add missing peers.
+	for id := range storeIDs {
+		if source.GetStorePeer(id) != nil {
+			continue
+		}
+		peer, err := cluster.AllocPeer(id)
+		if err != nil {
+			log.Debugf("peer alloc failed: %v", err)
+			return nil, kind, errors.Trace(err)
+		}
+		if cluster.IsRaftLearnerEnabled() {
+			steps = append(steps,
+				AddLearner{ToStore: id, PeerID: peer.Id},
+				PromoteLearner{ToStore: id, PeerID: peer.Id},
+			)
+		} else {
+			steps = append(steps, AddPeer{ToStore: id, PeerID: peer.Id})
+		}
+		kind |= OpRegion
+	}
+
+	// Check whether to transfer leader or not
+	intersection := getIntersectionStores(sourcePeers, targetPeers)
+	leaderID := source.Leader.GetStoreId()
+	isFound := false
+	for _, storeID := range intersection {
+		if storeID == leaderID {
+			isFound = true
+			break
+		}
+	}
+	if !isFound {
+		steps = append(steps, TransferLeader{FromStore: source.Leader.GetStoreId(), ToStore: target.Leader.GetStoreId()})
+		kind |= OpLeader
+	}
+
+	// Remove redundant peers.
+	for _, peer := range sourcePeers {
+		if _, ok := storeIDs[peer.GetStoreId()]; ok {
+			continue
+		}
+		steps = append(steps, RemovePeer{FromStore: peer.GetStoreId()})
+		kind |= OpRegion
+	}
+
+	return steps, kind, nil
+}
+
+// getIntersectionStores returns the stores included in two region's peers.
+func getIntersectionStores(a []*metapb.Peer, b []*metapb.Peer) []uint64 {
+	set := make([]uint64, 0)
+	hash := make(map[uint64]struct{})
+
+	for _, peer := range a {
+		hash[peer.GetStoreId()] = struct{}{}
+	}
+
+	for _, peer := range b {
+		if _, found := hash[peer.GetStoreId()]; found {
+			set = append(set, peer.GetStoreId())
+		}
+	}
+
+	return set
 }
